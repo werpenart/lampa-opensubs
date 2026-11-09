@@ -1165,7 +1165,8 @@
   var audio = null;
   var audioDenied = ''; // почему подстройка по звуку не работает (для меню)
   var AUDIO_STEP = 0.1;
-  var AUDIO_WIN = 180;
+  var AUDIO_WIN = 480; // секунд звука в одной проверке (на реальных сериалах 3 минут мало)
+  var AUDIO_MIN = 240;
 
   function audioStop() {
     if (!audio) return;
@@ -1230,16 +1231,19 @@
       a.lastT = t;
       a.analyser.getFloatFrequencyData(a.freq);
       var hz = a.ctx.sampleRate / 2 / a.freq.length;
-      var speech = 0, total = 0;
+      if (!a.prev) a.prev = new Float32Array(a.freq.length);
+      // энергия полосы речи (лог) и спектральный поток — «всплески» новых звуков в этой полосе
+      var speech = 0, flux = 0;
       for (var i = 1; i < a.freq.length; i++) {
         var f = i * hz;
-        if (f < 80 || f > 8000) continue;
-        var p = Math.pow(10, a.freq[i] / 10);
-        total += p;
-        if (f >= 300 && f <= 3400) speech += p;
+        if (f < 300 || f > 3400) continue;
+        var db = a.freq[i] > -200 ? a.freq[i] : -200;
+        speech += Math.pow(10, db / 10);
+        if (db > a.prev[i]) flux += db - a.prev[i];
+        a.prev[i] = db;
       }
-      if (!a.evals) a.status = 'слушает: ' + Math.round(a.samples.length / 10) + ' с из 120 нужных';
-      a.samples.push({ t: t, e: total > 0 ? Math.log(speech + 1e-12) + 2 * (speech / total) : -30, s: a.seg });
+      if (!a.evals) a.status = 'слушает: ' + Math.round(a.samples.length / 10) + ' с из ' + AUDIO_MIN + ' нужных';
+      a.samples.push({ t: t, e: Math.log(speech + 1e-12), f: flux, s: a.seg });
       if (a.samples.length > 6000) a.samples.splice(0, a.samples.length - 6000);
       if (Date.now() - a.lastEval > 30000) {
         a.lastEval = Date.now();
@@ -1266,21 +1270,40 @@
     if (pts.length < 2) return;
     var tEnd = pts[pts.length - 1].t;
     var tStart = Math.max(pts[0].t, tEnd - AUDIO_WIN);
-    if (tEnd - tStart < 120) return;
+    if (tEnd - tStart < AUDIO_MIN) return;
     pts = pts.filter(function (x) { return x.t >= tStart; });
 
     var n = Math.floor((tEnd - tStart) / AUDIO_STEP);
-    var g = new Float32Array(n);
+    var ge = new Float32Array(n), gf = new Float32Array(n);
     var k = 0;
     for (var i = 0; i < n; i++) {
       var tt = tStart + i * AUDIO_STEP;
       while (k < pts.length - 1 && pts[k + 1].t <= tt) k++;
-      g[i] = pts[k].e;
+      ge[i] = pts[k].e;
+      gf[i] = pts[k].f || 0;
     }
-    var mean = 0;
-    for (var m = 0; m < n; m++) mean += g[m];
-    mean /= n;
-    for (var m2 = 0; m2 < n; m2++) g[m2] -= mean;
+    // энергия относительно фона ближайших ±3 с (вычитаем скользящую медиану): музыка и шум уходят, речь остаётся
+    var rel = new Float32Array(n);
+    var win = [];
+    for (var i2 = 0; i2 < n; i2++) {
+      win.length = 0;
+      for (var j2 = Math.max(0, i2 - 30); j2 <= Math.min(n - 1, i2 + 30); j2++) win.push(ge[j2]);
+      win.sort(function (x, y) { return x - y; });
+      rel[i2] = ge[i2] - win[win.length >> 1];
+    }
+    var zs = function (arr) {
+      var mu = 0, sq2 = 0;
+      for (var q1 = 0; q1 < n; q1++) mu += arr[q1];
+      mu /= n;
+      for (var q2 = 0; q2 < n; q2++) sq2 += (arr[q2] - mu) * (arr[q2] - mu);
+      var sd1 = Math.sqrt(sq2 / n) || 1;
+      for (var q3 = 0; q3 < n; q3++) arr[q3] = (arr[q3] - mu) / sd1;
+      return arr;
+    };
+    zs(rel);
+    zs(gf);
+    var g = new Float32Array(n);
+    for (var m = 0; m < n; m++) g[m] = rel[m] + gf[m];
 
     var c = composed(track.os_id);
     var cues = parseCues(texts[track.os_id]);
@@ -1319,8 +1342,12 @@
     var shift = bestD * AUDIO_STEP;
     log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1));
     a.evals = (a.evals || 0) + 1;
-    var need = dmax <= 12 ? 3.5 : dmax <= 20 ? 3.8 : 4.5; // при узком поиске хватает меньшей уверенности
-    if (z1 < need || z2 > z1 * 0.8) {
+    var need = dmax <= 12 ? 3.3 : dmax <= 20 ? 3.6 : 4.0; // при узком поиске хватает меньшей уверенности
+    // одинаковый сдвиг в двух проверках подряд — тоже уверенность, даже если каждая чуть ниже порога
+    var prevE = a.lastShift;
+    a.lastShift = { d: shift, z: z1 };
+    var agree = prevE && Math.abs(prevE.d - shift) <= 0.3 && prevE.z >= need - 0.5 && z1 >= need - 0.5 && z2 <= z1 * 0.7;
+    if (!agree && (z1 < need || z2 > z1 * 0.7)) {
       a.status = 'слушает ' + Math.round(tEnd - tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
       return;
     }
