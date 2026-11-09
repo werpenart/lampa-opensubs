@@ -8,7 +8,7 @@
 Lampa → Настройки → Расширения → Добавить плагин:
 
 ```
-https://raw.githack.com/werpenart/lampa-opensubs/main/opensubs.js
+https://werpenart.github.io/lampa-opensubs/opensubs.js
 ```
 
 Затем Настройки → **OpenSubtitles** → **API-ключ**: свой ключ с opensubtitles.com (Профиль → API consumers).
