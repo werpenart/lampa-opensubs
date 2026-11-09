@@ -272,24 +272,6 @@
     return sc;
   }
 
-  // лучшие N на язык: живые переводы, финальные релизы, затем по популярности
-  function pick(list, langs, perLang) {
-    var groups = {};
-    for (var i = 0; i < list.length; i++) {
-      var a = list[i].attributes;
-      if (!a || !a.files || !a.files.length) continue;
-      if (a.machine_translated || a.ai_translated) continue;
-      a._score = score(a);
-      (groups[a.language] = groups[a.language] || []).push(a);
-    }
-    var out = [];
-    for (var j = 0; j < langs.length; j++) {
-      var g = (groups[langs[j]] || []).sort(function (x, y) { return y._score - x._score; });
-      out = out.concat(g.slice(0, perLang));
-    }
-    return out;
-  }
-
   // ---------- плеер ----------
 
   function videoSubs() {
@@ -302,45 +284,69 @@
     }
   }
 
-  function inject(token, items) {
-    if (token !== current || !items.length) return;
+  // ---------- сеанс текущего видео ----------
+  // Поиск — при старте (бесплатно). Скачивание — только когда субтитры включены кнопкой CC,
+  // и только одного файла на нужном языке; остальные варианты скачиваются при выборе в меню.
 
-    var state = videoSubs();
-    if (!state) return log('встроенный плеер не активен, субтитры не добавлены');
+  var session = null; // { data, card, audio, found: {lang: [attrs]}, searching, want }
 
-    // у видео есть свои дорожки (например, из HLS) — не перекрываем их своим списком
-    if (!state.subs.length && state.video.textTracks && state.video.textTracks.length) {
-      return log('у видео есть встроенные дорожки, пропускаем');
+  function langName(code) {
+    return LANG_NAMES[code] || String(code || '').toUpperCase();
+  }
+
+  function normLang(code) {
+    code = String(code || '').toLowerCase();
+    if (code === 'ua') return 'uk';
+    return code.split('-')[0];
+  }
+
+  // язык озвучки: метка дорожки («(EN) Оригинал», «Украинский», «DUB | …»), иначе язык оригинала фильма
+  function detectAudio(data, card) {
+    var tr = typeof data.translate === 'string' ? data.translate : '';
+    var parts = [data.voice_name || '', tr, data.title || ''];
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i];
+      if (!t) continue;
+      if (/\((en|eng)\)|\beng\b|english|англ/i.test(t)) return 'en';
+      if (/\((uk|ua|ukr)\)|\bukr\b|україн|украин/i.test(t)) return 'uk';
+      if (/\((ru|rus)\)|\brus\b|русск/i.test(t)) return 'ru';
+      if (/оригинал|оригінал|original/i.test(t)) return normLang(card.original_language) || 'en';
+      if (/\b(dub|mvo|avo|dvo)\b|дубл|многогол|двухгол|одногол|закадр|профессион|любительск/i.test(t)) return 'ru';
     }
+    return null;
+  }
 
-    var list = state.subs.filter(function (s) { return !s.opensubs; });
-    var base = list.length;
-    for (var i = 0; i < items.length; i++) {
-      items[i].index = base + i;
-      list.push(items[i]);
+  function fallbackLangs() {
+    return String(setting('langs', 'ru,uk,en')).split(',');
+  }
+
+  // порядок языков: выбранный режим (по озвучке или фиксированный), затем запасные
+  function langOrder(s) {
+    var mode = setting('lang', 'audio');
+    var first = mode === 'audio' ? (s && s.audio) : mode;
+    var out = [];
+    var add = function (l) { if (l && out.indexOf(l) < 0) out.push(l); };
+    add(first);
+    var fb = fallbackLangs();
+    for (var i = 0; i < fb.length; i++) add(fb[i]);
+    return out;
+  }
+
+  // лучшие варианты по языкам: {lang: [attrs…]}
+  function groupFound(list, langs) {
+    var groups = {};
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i].attributes;
+      if (!a || !a.files || !a.files.length) continue;
+      if (a.machine_translated || a.ai_translated) continue;
+      var l = normLang(a.language);
+      if (langs.indexOf(l) < 0) continue;
+      a._score = score(a);
+      a._lang = l;
+      (groups[l] = groups[l] || []).push(a);
     }
-
-    Lampa.Player.subtitles(list);
-
-    var anyShowing = state.subs.some(function (s) { return s.selected; });
-    if (!anyShowing && Lampa.Storage.field('subtitles_start')) {
-      var code = Lampa.Storage.field('subtitles_lang');
-      if (!code || code === 'auto') code = Lampa.Storage.get('language', 'ru');
-      // Lampa клонирует список, поэтому выбираем уже в том, что лежит в видео
-      var now = videoSubs();
-      var want = null;
-      if (now) for (var j = 0; j < now.subs.length; j++) {
-        if (now.subs[j].opensubs && now.subs[j].language === code) { want = now.subs[j]; break; }
-      }
-      if (want) {
-        want.selected = true;
-        want.mode = 'showing';
-        var box = document.querySelectorAll('.player-video__subtitles');
-        for (var b = 0; b < box.length; b++) box[b].classList.remove('hide');
-      }
-    }
-
-    if (flag('notify', true)) Lampa.Noty.show('OpenSubtitles: ' + items.length + ' субт.');
+    for (var k in groups) groups[k] = groups[k].sort(function (x, y) { return y._score - x._score; }).slice(0, 3);
+    return groups;
   }
 
   function shortRelease(a) {
@@ -348,63 +354,202 @@
     return r.length > 40 ? r.slice(0, 40) + '…' : r;
   }
 
+  function trackLabel(a) {
+    return langName(a._lang) + ' · OS · ' + shortRelease(a);
+  }
+
+  function notify(text) {
+    if (flag('notify', true)) Lampa.Noty.show(text);
+  }
+
   function load(data) {
+    session = null;
     if (!flag('enabled', true)) return;
-    if (!apiKey()) {
-      if (!window.opensubs_nokey_shown) {
-        window.opensubs_nokey_shown = true;
-        Lampa.Noty.show('OpenSubtitles: укажите API-ключ в настройках плагина');
-      }
-      return;
-    }
     if (data.iptv || data.youtube) return;
 
     var card = activeCard();
     if (!card) return log('нет карточки');
 
-    var langs = String(setting('langs', 'ru,uk,en')).split(',');
+    var s = session = { data: data, card: card, audio: detectAudio(data, card), found: {}, searching: false, want: undefined };
+    log('озвучка', s.audio);
+
+    if (!apiKey()) {
+      if (ccWanted()) notify('OpenSubtitles: укажите API-ключ в настройках плагина');
+      return;
+    }
+
+    var langs = langOrder(s);
     var p = buildQuery(card, data, langs);
     if (!p) return log('нет номера серии');
 
-    var token = current = {};
-
+    s.searching = true;
     xhr('GET', API + '/subtitles?' + query(p), null, function (json) {
-      if (token !== current) return;
-
-      var chosen = pick(json.data || [], langs, parseInt(setting('perlang', '1'), 10) || 1);
-      if (!chosen.length) return log('ничего не найдено', p);
-
-      var slots = [];
-      var left = chosen.length;
-      var finish = function () {
-        if (--left > 0) return;
-        inject(token, slots.filter(function (x) { return x; }));
-      };
-
-      chosen.forEach(function (a, k) {
-        var fid = a.files[0].file_id;
-        download(fid, function (text, link) {
-          if (text) texts[fid] = text;
-          var url = text ? textUrl(applySync(text, getSync(fid))) : link;
-          if (url) slots[k] = {
-            label: (LANG_NAMES[a.language] || a.language) + ' · OS · ' + shortRelease(a),
-            url: url,
-            language: a.language,
-            opensubs: true,
-            os_id: fid
-          };
-          finish();
-        }, function (err) {
-          log('download fail', err);
-          if (err && err.remaining === 0 && flag('notify', true)) {
-            Lampa.Noty.show('OpenSubtitles: дневной лимит скачиваний исчерпан');
-          }
-          finish();
-        });
-      });
+      if (session !== s) return;
+      s.searching = false;
+      s.found = groupFound(json.data || [], langs);
+      if (ccWanted()) turnOn(s, true);
+      updateButtons();
     }, function (status, json) {
+      s.searching = false;
       log('search fail', status, json);
+      updateButtons();
     });
+  }
+
+  // добавить скачанный файл в список субтитров плеера, вернуть объект дорожки из плеера
+  function ensureTrack(a, done, fail) {
+    var fid = a.files[0].file_id;
+    var have = findTrack(fid);
+    if (have) return done(have);
+
+    download(fid, function (text, link) {
+      if (text) texts[fid] = text;
+      var url = text ? textUrl(applySync(text, getSync(fid))) : link;
+      var state = videoSubs();
+      if (!url || !state) return fail();
+      var list = copySubs(state.subs);
+      list.push({ label: trackLabel(a), url: url, language: a._lang, opensubs: true, os_id: fid, index: list.length });
+      Lampa.Player.subtitles(list);
+      var t = findTrack(fid);
+      t ? done(t) : fail();
+    }, function (err) {
+      log('download fail', err);
+      if (err && err.remaining === 0) Lampa.Noty.show('OpenSubtitles: дневной лимит скачиваний исчерпан');
+      fail();
+    });
+  }
+
+  function findTrack(fid) {
+    var subs = trackList();
+    for (var i = 0; i < subs.length; i++) if (subs[i].os_id === fid) return subs[i];
+    return null;
+  }
+
+  // Lampa определяет у объектов свойство mode — для повторной передачи берём чистые копии
+  function copySubs(subs) {
+    return subs.map(function (x, i) {
+      var c = {};
+      for (var k in x) if (k !== 'mode' && k !== 'ready' && k !== 'selected') c[k] = x[k];
+      c.index = i;
+      return c;
+    });
+  }
+
+  function sourceTrackFor(langs) {
+    var subs = trackList().filter(function (x) { return !x.opensubs; });
+    if (!subs.length) return null;
+    for (var i = 0; i < langs.length; i++) {
+      for (var j = 0; j < subs.length; j++) {
+        var l = normLang(subs[j].language || subs[j].lang || subs[j].srclang);
+        if (l === langs[i]) return subs[j];
+      }
+    }
+    return null;
+  }
+
+  // включить субтитры на нужном языке: субтитры источника на этом языке, иначе лучший файл OpenSubtitles
+  function turnOn(s, auto) {
+    var langs = langOrder(s);
+    for (var i = 0; i < langs.length; i++) {
+      var src = sourceTrackFor([langs[i]]);
+      if (src) {
+        showTrack(src);
+        return true;
+      }
+      var cand = s.found[langs[i]];
+      if (cand && cand.length) {
+        s.pending = true;
+        updateButtons();
+        ensureTrack(cand[0], function (t) {
+          s.pending = false;
+          if (session === s && ccWanted()) showTrack(t);
+          updateButtons();
+        }, function () {
+          s.pending = false;
+          updateButtons();
+        });
+        return true;
+      }
+    }
+    // на нужных языках ничего — берём любые субтитры источника
+    var any = trackList()[0];
+    if (any) {
+      showTrack(any);
+      return true;
+    }
+    if (!auto) Lampa.Noty.show('Субтитры для этого видео не найдены');
+    return false;
+  }
+
+  function showTrack(track) {
+    if (session) session.want = track.os_id || track.label || track.index;
+    selectTrack(track);
+    updateButtons();
+  }
+
+  function turnOff() {
+    if (session) session.want = null;
+    selectTrack(null);
+    updateButtons();
+  }
+
+  function isShowing() {
+    var subs = trackList();
+    for (var i = 0; i < subs.length; i++) if (subs[i].selected) return subs[i];
+    return null;
+  }
+
+  function ccWanted() {
+    return flag('cc', false);
+  }
+
+  function setCc(v) {
+    Lampa.Storage.set('opensubs_cc', v ? 'true' : 'false');
+  }
+
+  // кнопка CC: включить или выключить
+  function toggleCc() {
+    if (isShowing()) {
+      setCc(false);
+      return turnOff();
+    }
+    setCc(true);
+    var s = session;
+    if (s && s.searching) {
+      updateButtons();
+      return Lampa.Noty.show('Ищу субтитры…');
+    }
+    if (s) {
+      if (!turnOn(s, false)) setCc(false);
+    } else {
+      var any = trackList()[0];
+      if (any) showTrack(any);
+      else {
+        setCc(false);
+        Lampa.Noty.show(apiKey() ? 'Субтитры для этого видео не найдены' : 'OpenSubtitles: укажите API-ключ в настройках плагина');
+      }
+    }
+    updateButtons();
+  }
+
+  // Lampa после загрузки видео сама выбирает дорожку по своим настройкам — возвращаем выбор пользователя
+  function reassert() {
+    var s = session;
+    if (!s || typeof s.want === 'undefined') return;
+    var subs = trackList();
+    var on = isShowing();
+    if (s.want === null) {
+      if (on) selectTrack(null);
+    } else {
+      for (var i = 0; i < subs.length; i++) {
+        var id = subs[i].os_id || subs[i].label || subs[i].index;
+        if (id === s.want && on !== subs[i]) {
+          selectTrack(subs[i]);
+          break;
+        }
+      }
+    }
+    updateButtons();
   }
 
   // ---------- синхронизация ----------
@@ -487,19 +632,13 @@
     var url = textUrl(applySync(texts[fid], sync));
     var state = videoSubs();
     if (!url || !state) return;
-    var list = state.subs.map(function (x) {
-      var copy = {};
-      for (var k in x) if (k !== 'mode' && k !== 'ready' && k !== 'selected') copy[k] = x[k];
-      if (x.os_id === fid) copy.url = url;
-      return copy;
-    });
+    var list = copySubs(state.subs);
+    for (var j = 0; j < list.length; j++) if (list[j].os_id === fid) list[j].url = url;
     Lampa.Player.subtitles(list);
     var now = videoSubs();
     if (now) for (var i = 0; i < now.subs.length; i++) {
       if (now.subs[i].os_id === fid) {
-        now.subs[i].selected = true;
-        now.subs[i].mode = 'showing';
-        cueBox(true);
+        showTrack(now.subs[i]);
       }
     }
   }
@@ -697,16 +836,34 @@
     { value: 'backdrop', title: 'Тёмная подложка' }
   ];
 
-  // Lucide «captions» (ISC), подогнана под иконки плеера Lampa: поле 21×21 (viewBox обрезан по рамке) и линия 2.5
-  var ICON = '<svg viewBox="1.5 1.5 21 21" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
-    '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M7 15h4M15 15h2M7 11h2M13 11h4"/></svg>';
+  // Иконка CC в сетке спрайтов плеера Lampa (21×21, линия 2.5). Выключено — контур, включено — заливка
+  // (буквы вырезаны маской, сквозь них виден фон кнопки).
+  var CC_PATH = 'M9.50 8.37A2.7 2.7 0 1 0 9.50 12.63M15.86 8.37A2.7 2.7 0 1 0 15.86 12.63';
+  var ccSeq = 0;
 
+  function ccIcon() {
+    var id = 'ops-cc-mask-' + (++ccSeq);
+    return '<svg viewBox="0 0 21 21" fill="none">' +
+      '<defs><mask id="' + id + '"><rect x="0" y="0" width="21" height="21" fill="#fff"/>' +
+      '<path d="' + CC_PATH + '" stroke="#000" stroke-width="2.3" stroke-linecap="round"/></mask></defs>' +
+      '<g class="ops-cc-off"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
+      '<path d="' + CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></g>' +
+      '<g class="ops-cc-on"><rect x="0" y="2.5" width="21" height="16" rx="4.4" fill="currentColor" mask="url(#' + id + ')"/></g>' +
+      '</svg>';
+  }
+
+  var ICON = '<svg viewBox="0 0 21 21" fill="none"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
+    '<path d="' + CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></svg>';
 
   function css() {
     if (document.getElementById('opensubs-style')) return;
     var sel = '.player-video__subtitles';
     var rules = [
       'body.ops-has-btn .player-panel__subs{display:none !important}',
+      '.ops-btn .ops-cc-on{display:none}',
+      '.ops-btn.ops-on .ops-cc-on{display:inline}',
+      '.ops-btn.ops-on .ops-cc-off{display:none}',
+      '.ops-btn.ops-pending svg{opacity:.5}',
       'body.ops-shadow-none ' + sel + '{text-shadow:none !important}',
       'body.ops-shadow-none ' + sel + ' .player-video__subtitles-text{background:none !important}',
       'body.ops-shadow-soft ' + sel + '{text-shadow:0 0.05em 0.15em rgba(0,0,0,.95),0 0 0.5em rgba(0,0,0,.7) !important}',
@@ -784,7 +941,7 @@
       title: 'Субтитры',
       nohide: true,
       items: [
-        { title: 'Язык субтитров', subtitle: on ? (on.label || on.language || 'Дорожка') : (subs.length ? 'Выключены' : 'Нет субтитров'), name: 'lang' },
+        { title: 'Язык субтитров', subtitle: (on ? (on.label || on.language || 'Дорожка') : 'Выключены') + (session && session.audio && setting('lang', 'audio') === 'audio' ? ' · озвучка: ' + langName(session.audio) : ''), name: 'lang' },
         { title: 'Размер шрифта', subtitle: titleOf(SIZES, setting('size', 'auto')), name: 'size' },
         { title: 'Тень шрифта', subtitle: titleOf(SHADOWS, setting('shadow', 'auto')), name: 'shadow' },
         { title: 'Синхронизация', subtitle: on && on.os_id ? syncTitle(getSync(on.os_id)) : 'Для субтитров OpenSubtitles', name: 'sync' }
@@ -797,13 +954,24 @@
         };
 
         if (a.name === 'lang') {
-          if (!subs.length) {
-            Lampa.Noty.show(apiKey() ? 'Субтитры для этого видео не найдены' : 'OpenSubtitles: укажите API-ключ в настройках плагина');
-            return again();
-          }
-          var items = [{ title: 'Выключены', selected: !on, track: null }];
+          var items = [{ title: 'Выключены', selected: !on, act: 'off' }];
           for (var j = 0; j < subs.length; j++) {
             items.push({ title: subs[j].label || subs[j].language || ('Дорожка ' + (j + 1)), selected: subs[j] === on, track: subs[j] });
+          }
+          // найденные, но ещё не скачанные варианты OpenSubtitles
+          if (session) {
+            var order = langOrder(session);
+            for (var l = 0; l < order.length; l++) {
+              var cand = session.found[order[l]] || [];
+              for (var c = 0; c < cand.length; c++) {
+                if (findTrack(cand[c].files[0].file_id)) continue;
+                items.push({ title: trackLabel(cand[c]), subtitle: 'Скачать', cand: cand[c] });
+              }
+            }
+          }
+          if (items.length === 1) {
+            Lampa.Noty.show(!apiKey() ? 'OpenSubtitles: укажите API-ключ в настройках плагина' : session && session.searching ? 'Ищу субтитры…' : 'Субтитры для этого видео не найдены');
+            return again();
           }
           closeSelects();
           return Lampa.Select.show({
@@ -812,7 +980,18 @@
             nohide: true,
             onBack: again,
             onSelect: function (b) {
-              selectTrack(b.track);
+              if (b.act === 'off') {
+                setCc(false);
+                turnOff();
+              } else if (b.track) {
+                setCc(true);
+                showTrack(b.track);
+              } else if (b.cand) {
+                setCc(true);
+                ensureTrack(b.cand, function (t) { showTrack(t); }, function () {
+                  Lampa.Noty.show('Не удалось скачать субтитры');
+                });
+              }
               back();
             }
           });
@@ -849,21 +1028,53 @@
   function makeButton() {
     var btn = document.createElement('div');
     btn.className = 'player-panel__opensubs ops-btn button selector';
-    btn.innerHTML = ICON + '<div class="tooltip">Субтитры</div>';
+    btn.innerHTML = ccIcon() + '<div class="tooltip">Субтитры</div>';
     $(btn).on('hover:enter', function () {
-      var enabled = Lampa.Controller.enabled().name;
-      menu(function () {
-        closeSelects();
-        Lampa.Controller.toggle(enabled);
-        // панель при возврате ставит фокус на «паузу» — возвращаем его на нашу кнопку
-        try {
-          if (enabled === 'player_panel' && document.body.contains(btn)) {
-            Lampa.Controller.collectionFocus(btn, Lampa.PlayerPanel.render());
-          }
-        } catch (e) {}
-      });
+      toggleCc();
     });
     return btn;
+  }
+
+  function updateButtons() {
+    var on = !!isShowing();
+    var pending = !!(session && (session.pending || (session.searching && ccWanted())));
+    var btns = document.querySelectorAll('.ops-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('ops-on', on || pending);
+      btns[i].classList.toggle('ops-pending', pending && !on);
+      var tip = btns[i].querySelector('.tooltip');
+      if (tip) tip.textContent = on ? 'Выключить субтитры' : 'Включить субтитры';
+    }
+  }
+
+  function openSettingsMenu() {
+    var back = function () {
+      closeSelects();
+      Lampa.Controller.toggle(Lampa.Platform.screen('mobile') ? 'player' : 'player_panel');
+    };
+    closeSelects();
+    menu(back);
+  }
+
+  // пункт «Субтитры» в настройках плеера (шестерёнка) открывает наше меню
+  function hookPlayerSettings() {
+    if (!Lampa.Select.listener) return;
+    Lampa.Select.listener.follow('preshow', function (e) {
+      var act = e && e.active;
+      if (!act || !act.items || act._opensubs) return;
+      if (!(Lampa.Player.opened && Lampa.Player.opened())) return;
+      var item = null;
+      for (var i = 0; i < act.items.length; i++) if (act.items[i] && act.items[i].method === 'subs') item = act.items[i];
+      if (!item) return;
+      act._opensubs = true;
+      var on = isShowing();
+      item.subtitle = on ? (on.label || 'Включены') : 'Выключены';
+      var orig = act.onSelect;
+      act.onSelect = function (a) {
+        if (a && a.method === 'subs') return openSettingsMenu();
+        return orig && orig.apply(this, arguments);
+      };
+    });
   }
 
   // кнопка — отдельным блоком сразу после выбора качества (и в начале блока кнопок на телефоне)
@@ -898,7 +1109,18 @@
     Lampa.SettingsApi.addParam({
       component: 'opensubs',
       param: { name: 'opensubs_enabled', type: 'trigger', default: true },
-      field: { name: 'Искать субтитры', description: 'При запуске видео во встроенном плеере' }
+      field: { name: 'Искать субтитры', description: 'При запуске видео. Включаются кнопкой CC в плеере' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: {
+        name: 'opensubs_lang',
+        type: 'select',
+        values: { audio: 'Как у озвучки', ru: 'Русские', uk: 'Українські', en: 'English' },
+        default: 'audio'
+      },
+      field: { name: 'Язык субтитров', description: '«Как у озвучки» — по выбранной дорожке: (EN) Оригинал → английские, DUB → русские' }
     });
 
     Lampa.SettingsApi.addParam({
@@ -910,26 +1132,19 @@
           'ru,uk,en': 'Русские, украинские, английские',
           'ru,en': 'Русские, английские',
           'uk,en': 'Украинские, английские',
-          'ru,uk': 'Русские, украинские',
-          'ru': 'Только русские',
-          'uk': 'Только украинские',
+          'uk,ru,en': 'Украинские, русские, английские',
+          'en,ru': 'Английские, русские',
           'en': 'Только английские'
         },
         default: 'ru,uk,en'
       },
-      field: { name: 'Языки', description: 'Каждая дорожка — одно скачивание из дневного лимита' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_perlang', type: 'select', values: { '1': '1', '2': '2', '3': '3' }, default: '1' },
-      field: { name: 'Вариантов на язык', description: 'Разные релизы — на случай, если субтитры не совпали по времени' }
+      field: { name: 'Запасные языки', description: 'Если на языке озвучки субтитров нет' }
     });
 
     Lampa.SettingsApi.addParam({
       component: 'opensubs',
       param: { name: 'opensubs_notify', type: 'trigger', default: true },
-      field: { name: 'Уведомления', description: 'Показывать, сколько субтитров найдено' }
+      field: { name: 'Уведомления', description: 'Сообщать об отсутствующем API-ключе и других проблемах' }
     });
 
     Lampa.SettingsApi.addParam({
@@ -963,15 +1178,23 @@
     css();
     applyStyle();
     addButton();
+    hookPlayerSettings();
+    try {
+      Lampa.PlayerVideo.listener.follow('subs', function () { setTimeout(reassert, 0); });
+    } catch (e) {}
+    var timer = null;
     Lampa.Player.listener.follow('start', function (data) {
       addButton();
       applyStyle();
+      clearInterval(timer);
+      timer = setInterval(updateButtons, 1000);
       current = null;
       revokeUrls(); // файлы прошлого видео больше не нужны
       try { load(data || {}); } catch (e) { log('error', e); }
     });
     Lampa.Player.listener.follow('destroy', function () {
       current = null;
+      clearInterval(timer); // сеанс не сбрасываем: Lampa шлёт destroy и при переключении серий
     });
     try { localStorage.removeItem('opensubs_links'); } catch (e) {} // кеш ссылок из первой версии
   }
