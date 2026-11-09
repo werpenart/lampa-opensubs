@@ -260,11 +260,15 @@
   // Финальные релизы: онлайн-источники обычно сделаны из них
   var GOOD_RELEASE = /blu-?ray|bdrip|brrip|bdremux|remux|web-?dl|webrip|web|amzn|nf|dsnp|hmax|atvp|itunes|hdrip|dvdrip/i;
 
+  // релиз прямо с платформы (NF, AMZN, ATVP…) — с её отбивкой в начале, как у онлайн-источников
+  var PLATFORM_RELEASE = /(^|[^a-z])(nf|amzn|atvp|dsnp|hmax|hulu|pcok|pmtp|stan|crav|itunes)([^a-z]|$)/i;
+
   function score(a) {
     var rel = String(a.release || '') + ' ' + String((a.files[0] && a.files[0].file_name) || '');
     var sc = Math.log(1 + (a.download_count || 0)); // 0…~14
     if (BAD_RELEASE.test(rel)) sc -= 100;
     if (GOOD_RELEASE.test(rel)) sc += 6;
+    if (PLATFORM_RELEASE.test(rel)) sc += 8;
     if (a.from_trusted) sc += 3;
     var fps = parseFloat(a.fps) || 0;
     if (fps && Math.abs(fps - 23.976) > 0.1 && Math.abs(fps - 24) > 0.1) sc -= 4; // 25/29.97/30 — чаще всего не наш хронометраж
@@ -591,14 +595,14 @@
 
   // --- файл
   function fileSync(fid) {
-    var c = store('opensubs_sync')[fid];
+    var c = store('opensubs_fsync')[fid];
     return { scale: (c && c.scale) || 1, offset: (c && c.offset) || 0, known: !!c };
   }
 
   function setFileSync(fid, f) {
-    var all = store('opensubs_sync');
+    var all = store('opensubs_fsync');
     all[fid] = { scale: f.scale, offset: round3(f.offset), auto: true, t: Date.now() };
-    storeSave('opensubs_sync', all, 300);
+    storeSave('opensubs_fsync', all, 300);
   }
 
   // --- видео
@@ -659,7 +663,7 @@
     } else {
       var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : round3(s.durDiff);
       all[k.exact] = { scale: v.scale, offset: round3(v.offset), anchors: v.anchors.slice(-8), manual: !!v.manual, src: v.src, dd: dd, t: Date.now() };
-      pr[k.source] = { scale: v.scale, offset: round3(v.offset), manual: !!v.manual, dd: dd, t: Date.now() };
+      pr[k.source] = { scale: v.scale, offset: round3(v.offset), manual: !!v.manual, dd: dd, rv: 2, t: Date.now() };
       // студии запоминаем только сдвиг начала (заставку), скорость у разных сериалов своя
       if (k.studio) pr[k.studio] = { scale: 1, offset: round3(v.offset + (v.anchors.length ? v.anchors[0].o * (v.scale - 1) : 0)), t: Date.now() };
     }
@@ -1061,11 +1065,11 @@
 
   function residual(s) {
     var k = residualKey(s);
-    var r = k && store('opensubs_resid')[k];
+    var r = k && store('opensubs_resid2')[k];
     if (r) return r.o;
     // запасной путь: ручная поправка прошлой серии этого источника, для которой известна заставка озвучки
     var pr = store('opensubs_vprior')[videoKeys(s).source];
-    if (pr && pr.manual && typeof pr.dd === 'number' && pr.scale === 1 && Math.abs(pr.offset - pr.dd) <= 60) return pr.offset - pr.dd;
+    if (pr && pr.rv === 2 && pr.manual && typeof pr.dd === 'number' && pr.scale === 1 && Math.abs(pr.offset - pr.dd) <= 60) return pr.offset - pr.dd;
     return null;
   }
 
@@ -1077,11 +1081,11 @@
     if (Math.abs(v.scale - 1) > 0.0005) return;
     var k = residualKey(s);
     if (!k) return;
-    var all = store('opensubs_resid');
+    var all = store('opensubs_resid2');
     var o = round3(v.offset - s.durDiff);
     if (Math.abs(o) > 60) return;
     all[k] = { o: o, t: Date.now() };
-    storeSave('opensubs_resid', all, 300);
+    storeSave('opensubs_resid2', all, 300);
     log('заставка площадки для сериала:', o);
   }
 
@@ -1250,8 +1254,9 @@
     var track = isShowing();
     if (!a || !track || !track.os_id || !texts[track.os_id]) return;
     var vs0 = videoSync();
-    if (vs0.src === 'duration' || vs0.manual) {
-      a.status = vs0.manual ? 'не нужна: поправка выставлена вручную' : 'не нужна: заставка посчитана по длительности';
+    if (vs0.manual) {
+      a.status = 'не нужна: поправка выставлена вручную';
+      a.evals = (a.evals || 0) + 1;
       return;
     }
 
@@ -1280,7 +1285,8 @@
     var c = composed(track.os_id);
     var cues = parseCues(texts[track.os_id]);
     var vs = videoSync();
-    var dmax = vs.anchors.length ? 20 : vs.prior ? 15 : 90;
+    // после расчёта по длительности остаётся только заставка площадки и разница релизов — ищем рядом
+    var dmax = vs.src === 'duration' && !vs.anchors.length ? 12 : vs.anchors.length ? 20 : vs.prior ? 15 : 90;
     var D = Math.round(dmax / AUDIO_STEP);
     var len = n + 2 * D;
     var ind = new Float32Array(len); // показ субтитров на сетке [tStart − dmax, tEnd + dmax]
@@ -1313,7 +1319,7 @@
     var shift = bestD * AUDIO_STEP;
     log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1));
     a.evals = (a.evals || 0) + 1;
-    var need = dmax <= 20 ? 3.8 : 4.5; // при узком поиске хватает меньшей уверенности
+    var need = dmax <= 12 ? 3.5 : dmax <= 20 ? 3.8 : 4.5; // при узком поиске хватает меньшей уверенности
     if (z1 < need || z2 > z1 * 0.8) {
       a.status = 'слушает ' + Math.round(tEnd - tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
       return;
