@@ -788,6 +788,7 @@
     if (v.anchors.length > 8) v.anchors = v.anchors.slice(-8);
     v.prior = false;
     setVideoSync(fitAnchors(v));
+    if (kind === 'phrase') learnResidual();
     resyncAll();
     return v;
   }
@@ -1052,6 +1053,33 @@
     }, function () { request(card); });
   }
 
+  function residualKey(s) {
+    var info = lampacInfo(s);
+    return info ? s.card.id + '|' + info.bal : null;
+  }
+
+  function residual(s) {
+    var k = residualKey(s);
+    var r = k && store('opensubs_resid')[k];
+    return r ? r.o : null;
+  }
+
+  // пользователь поправил вручную при известной заставке озвучки → остаток = заставка площадки
+  function learnResidual() {
+    var s = session;
+    if (!s || s.durDiff === null || typeof s.durDiff === 'undefined') return;
+    var v = videoSync();
+    if (Math.abs(v.scale - 1) > 0.0005) return;
+    var k = residualKey(s);
+    if (!k) return;
+    var all = store('opensubs_resid');
+    var o = round3(v.offset - s.durDiff);
+    if (Math.abs(o) > 60) return;
+    all[k] = { o: o, t: Date.now() };
+    storeSave('opensubs_resid', all, 300);
+    log('заставка площадки для сериала:', o);
+  }
+
   function waitDuration(done) {
     var tries = 0;
     var tick = function () {
@@ -1071,8 +1099,6 @@
     if (!s || s.durDone) return;
     s.durDone = true;
     if (!flag('durationsync', true)) return;
-    var v0 = videoSync();
-    if (v0.manual) return; // пользователь уже выставил сам
 
     originalDuration(s, function (orig, reason) {
       if (session !== s) return;
@@ -1093,6 +1119,7 @@
           v.scale = ratio;
           s.durStatus = 'другая частота кадров: ×' + ratio.toFixed(4);
         } else if (Math.abs(diff) <= 0.3) {
+          diff = 0;
           s.durStatus = 'совпадает с оригиналом, заставки нет';
         } else if (Math.abs(diff) <= 180) {
           v.offset = diff;
@@ -1101,8 +1128,19 @@
           s.durStatus = 'разница ' + diff.toFixed(0) + ' с — слишком большая, похоже на другую версию';
           return;
         }
+        s.durDiff = v.scale === 1 ? diff : null;
+        // заставка площадки (Netflix и т. п.) есть и в оригинале, но не в релизе, под который сделаны субтитры:
+        // её размер узнаём из ручной поправки на любой серии этого сериала у этого источника
+        var res = residual(s);
+        if (res !== null && v.scale === 1) {
+          v.offset += res;
+          s.durStatus += ', заставка площадки ' + (res > 0 ? '+' : '') + res.toFixed(1) + ' с';
+        }
         var old = videoSync();
-        if (old.manual) return;
+        if (old.manual) {
+          learnResidual(); // ручная поправка этой серии уже есть — узнаём из неё заставку площадки
+          return;
+        }
         setVideoSync(v);
         resyncAll();
         if (Math.abs(v.offset - (old.offset || 0)) >= 0.5 || v.scale !== (old.scale || 1)) notify('Субтитры подстроены под озвучку: ' + s.durStatus);
@@ -1372,6 +1410,7 @@
               v.manual = true;
               v.anchors = [];
               setVideoSync(v);
+              learnResidual();
               resyncAll();
               reopen();
             }
