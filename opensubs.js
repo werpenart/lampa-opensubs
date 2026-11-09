@@ -737,14 +737,10 @@
     if (!s) return { scale: 1, offset: 0, anchors: [] };
     if (!s.vsync) {
       var k = videoKeys(s);
-      var c = store('opensubs_vsync')[k.exact];
-      var pr = store('opensubs_vprior');
-      // другая серия того же источника, затем любой сериал этой студии: заставка обычно та же
-      var prior = !c && (pr[k.source] || (k.studio && pr[k.studio]));
+      var c = store('opensubs_vsync3')[k.exact];
+      // догадки «как у прошлой серии / как у студии» убраны: заставки у одной студии в разных сериалах разные
       s.vsync = c ? { scale: c.scale, offset: c.offset, anchors: c.anchors || [], manual: !!c.manual, src: c.src }
-        : prior ? { scale: pr[k.source] ? prior.scale : 1, offset: prior.offset, anchors: [], prior: pr[k.source] ? 'source' : 'studio' }
         : { scale: 1, offset: 0, anchors: [] };
-      if (prior) log('поправка из', s.vsync.prior, s.vsync.offset);
     }
     return s.vsync;
   }
@@ -754,20 +750,14 @@
     if (!s) return;
     s.vsync = v;
     var k = videoKeys(s);
-    var all = store('opensubs_vsync');
-    var pr = store('opensubs_vprior');
-    if (v.scale === 1 && !v.offset && !v.anchors.length && !v.src) {
-      delete all[k.exact];
-      delete pr[k.source];
-    } else {
+    var all = store('opensubs_vsync3');
+    if (v.scale === 1 && !v.offset && !v.anchors.length && !v.src) delete all[k.exact];
+    else {
       var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : round3(s.durDiff);
       all[k.exact] = { scale: v.scale, offset: round3(v.offset), anchors: v.anchors.slice(-8), manual: !!v.manual, src: v.src, dd: dd, t: Date.now() };
-      pr[k.source] = { scale: v.scale, offset: round3(v.offset), manual: !!v.manual, dd: dd, rv: 2, t: Date.now() };
-      // студии запоминаем только сдвиг начала (заставку), скорость у разных сериалов своя
-      if (k.studio) pr[k.studio] = { scale: 1, offset: round3(v.offset + (v.anchors.length ? v.anchors[0].o * (v.scale - 1) : 0)), t: Date.now() };
     }
-    storeSave('opensubs_vsync', all, 500);
-    storeSave('opensubs_vprior', pr, 200);
+    storeSave('opensubs_vsync3', all, 500);
+    try { localStorage.removeItem('opensubs_vprior'); localStorage.removeItem('opensubs_vsync'); } catch (e) {} // старые догадки
   }
 
   function composed(fid) {
@@ -1074,7 +1064,8 @@
       var v = m.match(/^\s*([^#\s][^\s]*)\s*$/m);
       if (!v) return fail('нет вариантов');
       var u = v[1];
-      if (!/^https?:/.test(u)) u = url.replace(/[^\/?]*(\?.*)?$/, '') + u;
+      if (/^\//.test(u)) u = url.match(/^https?:\/\/[^\/]+/)[0] + u;
+      else if (!/^https?:/.test(u)) u = url.replace(/[^\/?]*(\?.*)?$/, '') + u;
       hlsDuration(u, done, fail);
     }, fail);
   }
@@ -1091,9 +1082,10 @@
     else done(pickQ(item));
   }
 
-  function originalDuration(s, done) {
+  function originalDuration(s, done, balOverride) {
     var info = lampacInfo(s);
     if (!info) return done(null, 'источник не Lampac');
+    if (balOverride) info.bal = balOverride;
     var ep = episodeInfo(s.data);
     var key = info.bal + '|' + s.card.id + (ep ? '|' + ep.season + 'x' + ep.episode : '');
     var cache = store('opensubs_odur');
@@ -1185,11 +1177,8 @@
 
   function residual(s) {
     var k = residualKey(s);
-    var r = k && store('opensubs_resid2')[k];
+    var r = k && store('opensubs_resid3')[k];
     if (r) return r.o;
-    // запасной путь: ручная поправка прошлой серии этого источника, для которой известна заставка озвучки
-    var pr = store('opensubs_vprior')[videoKeys(s).source];
-    if (pr && pr.rv === 2 && pr.manual && typeof pr.dd === 'number' && pr.scale === 1 && Math.abs(pr.offset - pr.dd) <= 60) return pr.offset - pr.dd;
     return null;
   }
 
@@ -1201,12 +1190,32 @@
     if (Math.abs(v.scale - 1) > 0.0005) return;
     var k = residualKey(s);
     if (!k) return;
-    var all = store('opensubs_resid2');
+    var all = store('opensubs_resid3');
     var o = round3(v.offset - s.durDiff);
     if (Math.abs(o) > 60) return;
     all[k] = { o: o, t: Date.now() };
-    storeSave('opensubs_resid2', all, 300);
+    storeSave('opensubs_resid3', all, 300);
     log('заставка площадки для сериала:', o);
+  }
+
+  // Длительности оригинала у текущего источника и у других источников Lampac с дорожкой «Оригинальный».
+  // У одного источника «оригинал» бывает другой версией видео (ZetflixDB: HBO Max на 30 с короче), поэтому
+  // сравниваем с несколькими.
+  var ORIG_SOURCES = ['phantom', 'aladin', 'zetflixdb'];
+
+  function originalDurations(s, done) {
+    var info = lampacInfo(s);
+    if (!info) return done([], 'источник не Lampac');
+    var bals = [info.bal];
+    for (var i = 0; i < ORIG_SOURCES.length; i++) if (bals.indexOf(ORIG_SOURCES[i]) < 0) bals.push(ORIG_SOURCES[i]);
+    var out = [], reasons = [], left = bals.length;
+    bals.forEach(function (b) {
+      originalDuration(s, function (d, why) {
+        if (d) out.push({ bal: b, d: d, own: b === info.bal });
+        else reasons.push(b + ': ' + why);
+        if (--left === 0) done(out, reasons.join('; '));
+      }, b);
+    });
   }
 
   function waitDuration(done) {
@@ -1274,9 +1283,9 @@
     };
 
     var runDuration = function () {
-    originalDuration(s, function (orig, reason) {
+    originalDurations(s, function (origs, reason) {
       if (session !== s) return;
-      if (!orig) {
+      if (!origs.length) {
         s.durStatus = 'не удалось: ' + reason;
         log('длительность оригинала:', reason);
         applyFpsOnly(s.durStatus);
@@ -1289,8 +1298,23 @@
           applyFpsOnly(s.durStatus);
           return finishD(false);
         }
+        var near = null, own = null;
+        for (var oi = 0; oi < origs.length; oi++) {
+          if (!near || Math.abs(cur - origs[oi].d) < Math.abs(cur - near.d)) near = origs[oi];
+          if (origs[oi].own) own = origs[oi];
+        }
+        log('длительность: видео', cur.toFixed(2), 'оригиналы', origs.map(function (o) { return o.bal + ' ' + o.d.toFixed(2); }).join(', '));
+        // есть оригинал той же длительности — значит, заставки нет; иначе берём оригинал своего источника
+        var orig = Math.abs(cur - near.d) <= 3 ? near.d : own ? own.d : near.d;
+        var spread = 0;
+        for (var oj = 0; oj < origs.length; oj++) spread = Math.max(spread, Math.abs(origs[oj].d - orig));
         var diff = cur - orig, ratio = cur / orig;
-        log('длительность: видео', cur.toFixed(2), 'оригинал', orig.toFixed(2), 'разница', diff.toFixed(2));
+        if (Math.abs(diff) <= 3 && Math.abs(diff) > 0.3) diff = 0.2; // разница сборок, не заставка
+        if (Math.abs(diff) > 3 && !own && spread > 1.5) {
+          s.durStatus = 'оригиналы у источников разной длины — сдвиг не определить';
+          applyFpsOnly(s.durStatus);
+          return finishD(false);
+        }
         var v = { scale: 1, offset: 0, anchors: [], src: 'duration' };
         if (Math.abs(ratio - 23.976 / 25) < 0.002 || Math.abs(ratio - 25 / 23.976) < 0.002) {
           v.scale = ratio;
@@ -1298,7 +1322,7 @@
         } else if (Math.abs(diff) <= 0.3) {
           diff = 0;
           s.durStatus = 'совпадает с оригиналом, заставки нет';
-        } else if (Math.abs(diff) <= 180) {
+        } else if (diff > 0 && diff <= 120) {
           v.offset = diff;
           s.durStatus = 'заставка озвучки ' + (diff > 0 ? '+' : '') + diff.toFixed(1) + ' с';
         } else {
@@ -1503,7 +1527,8 @@
     var cues = parseCues(texts[track.os_id]);
     var vs = videoSync();
     // после расчёта по длительности остаётся только заставка площадки и разница релизов — ищем рядом
-    var dmax = vs.src === 'duration' && !vs.anchors.length ? 12 : vs.anchors.length ? 20 : vs.prior ? 15 : 90;
+    // широкий поиск (±90 с) — только пока субтитры скрыты и ждут проверки; при показе звук лишь доводит время
+    var dmax = s0 && s0.waiting && !vs.anchors.length && vs.src !== 'duration' ? 90 : 15;
     var D = Math.round(dmax / AUDIO_STEP);
     var len = n + 2 * D;
     var ind = new Float32Array(len); // показ субтитров на сетке [tStart − dmax, tEnd + dmax]
@@ -1534,6 +1559,7 @@
     for (var w = 0; w < scores.length; w++) if (Math.abs(w - D - bestD) > 20) second = Math.max(second, scores[w]);
     var z2 = (second - sm) / sd;
     var shift = bestD * AUDIO_STEP;
+    var edge = Math.abs(shift) >= dmax - 2; // пик на краю диапазона поиска — почти наверняка ложный
     log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1));
     a.evals = (a.evals || 0) + 1;
     var need = dmax <= 12 ? 3.3 : dmax <= 20 ? 3.6 : 4.0; // при узком поиске хватает меньшей уверенности
@@ -1541,7 +1567,7 @@
     var prevE = a.lastShift;
     a.lastShift = { d: shift, z: z1 };
     var agree = prevE && Math.abs(prevE.d - shift) <= 0.3 && prevE.z >= need - 0.5 && z1 >= need - 0.5 && z2 <= z1 * 0.7;
-    if (!agree && (z1 < need || z2 > z1 * 0.7)) {
+    if (edge || (!agree && (z1 < need || z2 > z1 * 0.7))) {
       a.status = 'слушает ' + Math.round(tEnd - tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
       // полное окно прослушано, а уверенности нет — показываем как есть
       if (s0 && s0.waiting && tEnd - tStart >= AUDIO_TARGET) finishBackground('нет уверенности');
@@ -1579,7 +1605,7 @@
     var parts = [];
     if (Math.abs(v.offset) >= 0.05) parts.push((v.offset > 0 ? '+' : '') + v.offset.toFixed(2) + ' сек.');
     if (Math.abs(v.scale - 1) > 0.0005) parts.push('скорость ×' + v.scale.toFixed(4));
-    var from = v.manual ? ' (вручную)' : v.src === 'duration' ? ' (по длительности оригинала)' : v.prior === 'studio' ? ' (взято у студии озвучки)' : v.prior === 'source' ? ' (с прошлой серии)' : '';
+    var from = v.manual ? ' (вручную)' : v.src === 'duration' ? ' (по длительности оригинала)' : '';
     return parts.length ? parts.join(', ') + ' для этого источника' + from : 'Без поправок для этого источника';
   }
 
