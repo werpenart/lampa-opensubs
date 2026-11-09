@@ -472,10 +472,9 @@
     s.bg = t.os_id;
     s.want = null; // Lampa по своим настройкам может включить дорожку сама — reassert её выключит
     s.waiting = Date.now();
+    s.useAudio = true;
     selectTrack(null);
     log('фоновая синхронизация', t.label);
-    durationSync();
-    maybeAutoSync(t);
     audioStart();
     updateButtons();
     if (!audio) return finishBackground('нет звука');
@@ -514,10 +513,23 @@
         ensureTrack(cand[0], function (t) {
           s.pending = false;
           if (session === s && ccWanted()) {
-            if (auto && !immediate && canListen() && !videoSync().manual) startBackground(s, t);
-            else {
+            if (!auto || immediate) {
               showTrack(t);
               maybeAutoSync(t);
+            } else {
+              // автовключение: файл выравнивается по английским, видео — по длительности оригинала и кадрам.
+              // Фильмы и серии с известной длительностью оригинала показываем сразу; остальные — после проверки по звуку.
+              maybeAutoSync(t);
+              s.pending = true;
+              updateButtons();
+              durationSync(function (ok) {
+                s.pending = false;
+                if (session !== s || !ccWanted()) return updateButtons();
+                if (ok || isMovie(s) || videoSync().manual || !canListen()) showTrack(t);
+                else startBackground(s, t);
+                updateButtons();
+              });
+              return;
             }
           }
           updateButtons();
@@ -546,8 +558,14 @@
     selectTrack(track);
     updateButtons();
     if (track && track.os_id) {
-      durationSync();
-      audioStart();
+      var s1 = session;
+      // звук — только для сериалов, где не получилось по длительности оригинала (у фильмов не нужен)
+      durationSync(function (ok) {
+        if (s1 && session === s1 && !ok && !isMovie(s1)) {
+          s1.useAudio = true;
+          audioStart();
+        }
+      });
     }
   }
 
@@ -952,7 +970,6 @@
 
   // при первом включении неанглийских субтитров — выровнять файл по английским (один раз на файл)
   function maybeAutoSync(track) {
-    if (track && track.os_id) audioStart();
     if (!flag('autosync', true) || !track || !track.os_id || track.language === 'en') return;
     if (fileSync(track.os_id).known) return;
     autoSync(track, function (res, reason) {
@@ -1003,13 +1020,14 @@
     return { host: m[1], bal: String(bal).toLowerCase(), acc: acc.join('&') };
   }
 
-  var ORIG_RX = /^\s*(оригинал|оригинальный|оригінал|original)/i;
+  var ORIG_RX = /оригинал|оригінал|original|^\s*(english|английск|англ\.?|eng)\b/i;
   var SUBS_RX = /^\s*субтитр/i; // оригинальная дорожка с вшитыми субтитрами — запасной эталон
 
   function pickOriginal(list, nameOf) {
     var alt = null;
     for (var i = 0; i < list.length; i++) {
       var n = nameOf(list[i]) || '';
+      if (/укр|ukr/i.test(n)) continue;
       if (ORIG_RX.test(n)) return list[i];
       if (!alt && SUBS_RX.test(n)) alt = list[i];
     }
@@ -1053,9 +1071,15 @@
     var cache = store('opensubs_odur');
     if (cache[key]) return done(cache[key].d);
 
-    var finish = function (item) {
-      if (!item) return done(null, 'у источника нет оригинальной дорожки');
+    // ссылки, которые Lampac собрал для себя (127.0.0.1), ведём на тот же адрес, что и видео
+    var fixHost = function (u) {
+      return String(u || '').replace(/^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:\d+)?/i, info.host);
+    };
+    var finish = function (item, why) {
+      if (!item) return done(null, why || 'у источника нет оригинальной дорожки');
+      item = { method: item.method, url: fixHost(item.url), quality: item.quality };
       playableUrl(item, function (u) {
+        u = fixHost(u);
         if (!/m3u8/i.test(u)) return done(null, 'не HLS');
         hlsDuration(u, function (d) {
           cache[key] = { d: d, t: Date.now() };
@@ -1068,9 +1092,9 @@
     var episodesOf = function (json, cb) {
       // json.type === 'episode': серии выбранной озвучки и список озвучек
       var voice = json.voice && pickOriginal(json.voice, function (v) { return v.name; });
-      if (!voice) return cb(null);
+      if (!voice) return cb(null, 'в списке озвучек нет оригинала (' + (json.voice || []).map(function (v) { return v.name; }).join(', ').slice(0, 80) + ')');
       if (voice.active) return cb(json);
-      getJSON(withAcc(voice.url), cb, function () { cb(null); });
+      getJSON(withAcc(fixHost(voice.url)), cb, function (e) { cb(null, 'не открылась озвучка «' + voice.name + '»: ' + e); });
     };
 
     var withAcc = function (u) { return info.acc ? u + (u.indexOf('?') >= 0 ? '&' : '?') + info.acc : u; };
@@ -1087,17 +1111,18 @@
       q.push('source=' + (card.source || 'tmdb'));
       if (ep) q.push('s=' + ep.season);
       getJSON(withAcc(info.host + '/lite/' + info.bal + '?' + q.join('&')), function (json) {
-        if (json.type === 'movie') return finish(pickOriginal(json.data || [], function (x) { return x.translate || x.details || x.title; }));
+        if (json.type === 'movie') return finish(pickOriginal(json.data || [], function (x) { return x.translate || x.details || x.title; }),
+          'в списке озвучек нет оригинала (' + (json.data || []).map(function (x) { return x.translate || x.details || ''; }).join(', ').slice(0, 80) + ')');
         if (json.type === 'episode' && ep) {
-          return episodesOf(json, function (list) {
-            if (!list) return finish(null);
+          return episodesOf(json, function (list, why) {
+            if (!list) return finish(null, why);
             var items = list.data || [];
             for (var i = 0; i < items.length; i++) if (parseInt(items[i].e, 10) === ep.episode) return finish(items[i]);
-            finish(null);
+            finish(null, 'в оригинале нет серии ' + ep.episode);
           });
         }
-        done(null, 'ответ источника: ' + json.type);
-      }, function (e) { done(null, 'запрос к источнику: ' + e); });
+        done(null, 'источник «' + info.bal + '» ответил «' + json.type + '»' + (ep ? '' : ' (серия не определена)'));
+      }, function (e) { done(null, 'источник «' + info.bal + '» не ответил: ' + e); });
     };
 
     var card = s.card;
@@ -1155,24 +1180,72 @@
     tick();
   }
 
-  // один раз за сеанс: сравнить длительность текущей озвучки с оригиналом
-  function durationSync() {
-    var s = session;
-    if (!s || s.durDone) return;
-    s.durDone = true;
-    if (!flag('durationsync', true)) return;
+  // частота кадров видео из HLS-плейлиста (FRAME-RATE)
+  function videoFps(s, done) {
+    var u = String(s.data.url || '');
+    if (!/m3u8/i.test(u)) return done(0);
+    getText(u, function (m) {
+      var f = m.match(/FRAME-RATE=([0-9.]+)/);
+      done(f ? parseFloat(f[1]) : 0);
+    }, function () { done(0); });
+  }
 
+  function isPal(f) { return Math.abs(f - 25) < 0.1; }
+  function isFilm(f) { return Math.abs(f - 23.976) < 0.1 || Math.abs(f - 24) < 0.1; }
+
+  // субтитры (эталон) и видео в разной системе кадров: 25 (PAL, ускоренное) против 23.976/24 → пересчёт скорости
+  function palScale(subFps, vidFps) {
+    if (!subFps || !vidFps) return 1;
+    if ((isPal(subFps) && isFilm(vidFps)) || (isFilm(subFps) && isPal(vidFps))) return (isPal(subFps) ? 25 : 23.976) / (isPal(vidFps) ? 25 : 23.976);
+    return 1;
+  }
+
+  function isMovie(s) {
+    return !episodeInfo(s.data) && !(s.card && (s.card.name || s.card.original_name));
+  }
+
+  // done(ok): поправка под это видео посчитана (по длительности оригинала)
+  function durationSync(done) {
+    var s = session;
+    if (!s) return done && done(false);
+    if (s.durDone === 'finished') return done && done(!!s.durOk);
+    (s.durWait = s.durWait || []).push(done || function () {});
+    if (s.durDone) return;
+    s.durDone = true;
+    var finishD = function (ok) {
+      s.durOk = ok;
+      s.durDone = 'finished';
+      var w = s.durWait || [];
+      s.durWait = [];
+      for (var i = 0; i < w.length; i++) try { w[i](ok); } catch (e) { log('error', e); }
+    };
+    if (!flag('durationsync', true)) return finishD(false);
+
+
+    var applyFpsOnly = function (why) {
+      if (s.palScale && s.palScale !== 1 && !videoSync().manual) {
+        setVideoSync({ scale: s.palScale, offset: 0, anchors: [], src: 'fps' });
+        resyncAll();
+        s.durStatus = why + '; частота кадров: ×' + s.palScale.toFixed(4);
+        notify('Субтитры подстроены под частоту кадров видео');
+      }
+    };
+
+    var runDuration = function () {
     originalDuration(s, function (orig, reason) {
       if (session !== s) return;
       if (!orig) {
         s.durStatus = 'не удалось: ' + reason;
-        return log('длительность оригинала:', reason);
+        log('длительность оригинала:', reason);
+        applyFpsOnly(s.durStatus);
+        return finishD(false);
       }
       waitDuration(function (cur) {
         if (session !== s) return;
         if (!cur) {
           s.durStatus = 'не удалось узнать длительность видео';
-          return;
+          applyFpsOnly(s.durStatus);
+          return finishD(false);
         }
         var diff = cur - orig, ratio = cur / orig;
         log('длительность: видео', cur.toFixed(2), 'оригинал', orig.toFixed(2), 'разница', diff.toFixed(2));
@@ -1188,9 +1261,15 @@
           s.durStatus = 'заставка озвучки ' + (diff > 0 ? '+' : '') + diff.toFixed(1) + ' с';
         } else {
           s.durStatus = 'разница ' + diff.toFixed(0) + ' с — слишком большая, похоже на другую версию';
-          return;
+          applyFpsOnly(s.durStatus);
+          return finishD(false);
         }
         s.durDiff = v.scale === 1 ? diff : null;
+        // видео и оригинал совпадают по скорости, но эталонные субтитры в другой системе кадров
+        if (v.scale === 1 && s.palScale && s.palScale !== 1) {
+          v.scale = s.palScale;
+          s.durStatus += '; частота кадров субтитров: ×' + s.palScale.toFixed(4);
+        }
         // заставка площадки (Netflix и т. п.) есть и в оригинале, но не в релизе, под который сделаны субтитры:
         // её размер узнаём из ручной поправки на любой серии этого сериала у этого источника
         var res = residual(s);
@@ -1201,12 +1280,24 @@
         var old = videoSync();
         if (old.manual) {
           learnResidual(); // ручная поправка этой серии уже есть — узнаём из неё заставку площадки
-          return;
+          return finishD(true);
         }
         setVideoSync(v);
         resyncAll();
         if (Math.abs(v.offset - (old.offset || 0)) >= 0.5 || v.scale !== (old.scale || 1)) notify('Субтитры подстроены под озвучку: ' + s.durStatus);
+        finishD(true);
       });
+    });
+    };
+
+    // частота кадров видео против эталонных субтитров, затем длительность оригинала
+    videoFps(s, function (vf) {
+      if (session !== s) return;
+      s.vidFps = vf;
+      var ref = s.found && s.found.en && s.found.en[0];
+      s.palScale = palScale(ref && parseFloat(ref.fps), vf);
+      if (s.palScale !== 1) log('кадры: субтитры', ref.fps, 'видео', vf, '→ ×' + s.palScale.toFixed(4));
+      runDuration();
     });
   }
 
@@ -1475,7 +1566,7 @@
         if (a.name === 'dur') {
           var on = flag('durationsync', true);
           Lampa.Storage.set('opensubs_durationsync', on ? 'false' : 'true');
-          if (!on && session) { session.durDone = false; durationSync(); }
+          if (!on && session) { session.durDone = false; session.durWait = []; durationSync(); }
           return reopen();
         }
 
@@ -1540,7 +1631,7 @@
 
         if (a.name === 'reset') {
           setVideoSync({ scale: 1, offset: 0, anchors: [] });
-          if (session) { session.vsync = null; session.durDone = false; }
+          if (session) { session.vsync = null; session.durDone = false; session.durWait = []; }
           resyncAll();
           durationSync();
           if (audio) { audio.samples = []; audio.told = false; }
