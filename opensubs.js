@@ -657,8 +657,9 @@
       delete all[k.exact];
       delete pr[k.source];
     } else {
-      all[k.exact] = { scale: v.scale, offset: round3(v.offset), anchors: v.anchors.slice(-8), manual: !!v.manual, src: v.src, t: Date.now() };
-      pr[k.source] = { scale: v.scale, offset: round3(v.offset), t: Date.now() };
+      var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : round3(s.durDiff);
+      all[k.exact] = { scale: v.scale, offset: round3(v.offset), anchors: v.anchors.slice(-8), manual: !!v.manual, src: v.src, dd: dd, t: Date.now() };
+      pr[k.source] = { scale: v.scale, offset: round3(v.offset), manual: !!v.manual, dd: dd, t: Date.now() };
       // студии запоминаем только сдвиг начала (заставку), скорость у разных сериалов своя
       if (k.studio) pr[k.studio] = { scale: 1, offset: round3(v.offset + (v.anchors.length ? v.anchors[0].o * (v.scale - 1) : 0)), t: Date.now() };
     }
@@ -1061,7 +1062,11 @@
   function residual(s) {
     var k = residualKey(s);
     var r = k && store('opensubs_resid')[k];
-    return r ? r.o : null;
+    if (r) return r.o;
+    // запасной путь: ручная поправка прошлой серии этого источника, для которой известна заставка озвучки
+    var pr = store('opensubs_vprior')[videoKeys(s).source];
+    if (pr && pr.manual && typeof pr.dd === 'number' && pr.scale === 1 && Math.abs(pr.offset - pr.dd) <= 60) return pr.offset - pr.dd;
+    return null;
   }
 
   // пользователь поправил вручную при известной заставке озвучки → остаток = заставка площадки
