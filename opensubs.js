@@ -416,7 +416,7 @@
       var state = videoSubs();
       if (!url || !state) return fail();
       var list = copySubs(state.subs);
-      list.push({ label: trackLabel(a), url: url, language: a._lang, opensubs: true, os_id: fid, index: list.length });
+      list.push({ label: trackLabel(a), url: url, language: a._lang, opensubs: true, os_id: fid, os_fps: parseFloat(a.fps) || 0, index: list.length });
       Lampa.Player.subtitles(list);
       var t = findTrack(fid);
       t ? done(t) : fail();
@@ -465,6 +465,25 @@
     } catch (e) {
       return false;
     }
+  }
+
+  // Таймлайн субтитров совпадает с видео: последняя реплика заканчивается до конца видео,
+  // но не раньше чем за 18% до него (титры). Иначе — другая версия, нужна проверка по звуку.
+  function timelineOk(t, done) {
+    var text = texts[t.os_id];
+    if (!text) return done(false, 'нет файла');
+    var cues = parseCues(text);
+    if (!cues.length) return done(false, 'пустой файл');
+    var c = composed(t.os_id);
+    var last = 0;
+    for (var i = 0; i < cues.length; i++) last = Math.max(last, cues[i].end * c.scale + c.offset);
+    waitDuration(function (dur) {
+      if (!dur) return done(false, 'длительность видео неизвестна');
+      var r = last / dur;
+      var why = 'последняя реплика ' + fmtTime(last).slice(0, 8) + ' из ' + fmtTime(dur).slice(0, 8);
+      log('таймлайн:', why, r.toFixed(3));
+      done(last <= dur + 5 && r >= 0.82, why);
+    });
   }
 
   // Автовключение: субтитры скачиваются и синхронизируются по звуку в фоне, а показываются, когда звук подтвердил время.
@@ -525,9 +544,18 @@
               durationSync(function (ok) {
                 s.pending = false;
                 if (session !== s || !ccWanted()) return updateButtons();
-                if (ok || isMovie(s) || videoSync().manual || !canListen()) showTrack(t);
-                else startBackground(s, t);
-                updateButtons();
+                if (ok || isMovie(s) || videoSync().manual || !canListen()) {
+                  showTrack(t);
+                  return updateButtons();
+                }
+                // оригинала у источника нет: сверяем таймлайн субтитров с длительностью видео
+                timelineOk(t, function (good, why) {
+                  if (session !== s || !ccWanted()) return updateButtons();
+                  s.timeline = why;
+                  if (good) showTrack(t);
+                  else startBackground(s, t);
+                  updateButtons();
+                });
               });
               return;
             }
@@ -1110,7 +1138,18 @@
       q.push('year=' + String(card.release_date || card.first_air_date || '0000').slice(0, 4));
       q.push('source=' + (card.source || 'tmdb'));
       if (ep) q.push('s=' + ep.season);
-      getJSON(withAcc(info.host + '/lite/' + info.bal + '?' + q.join('&')), function (json) {
+      var handle = function (json, depth) {
+        // источник сначала отдаёт список сезонов — переходим в нужный
+        if (json.type === 'season' && ep && depth < 2) {
+          var seasons = json.data || [];
+          for (var si = 0; si < seasons.length; si++) {
+            var sn = parseInt(seasons[si].id || seasons[si].s || String(seasons[si].name || '').replace(/\D+/g, ''), 10);
+            if (sn === ep.season && seasons[si].url) {
+              return getJSON(withAcc(fixHost(seasons[si].url)), function (j) { handle(j, depth + 1); }, function (e) { done(null, 'сезон не открылся: ' + e); });
+            }
+          }
+          return done(null, 'у источника нет сезона ' + ep.season);
+        }
         if (json.type === 'movie') return finish(pickOriginal(json.data || [], function (x) { return x.translate || x.details || x.title; }),
           'в списке озвучек нет оригинала (' + (json.data || []).map(function (x) { return x.translate || x.details || ''; }).join(', ').slice(0, 80) + ')');
         if (json.type === 'episode' && ep) {
@@ -1121,8 +1160,11 @@
             finish(null, 'в оригинале нет серии ' + ep.episode);
           });
         }
+        if (json.type === 'episode' && !json.voice) return done(null, 'у источника «' + info.bal + '» одна озвучка, оригинала нет');
         done(null, 'источник «' + info.bal + '» ответил «' + json.type + '»' + (ep ? '' : ' (серия не определена)'));
-      }, function (e) { done(null, 'источник «' + info.bal + '» не ответил: ' + e); });
+      };
+      getJSON(withAcc(info.host + '/lite/' + info.bal + '?' + q.join('&')), function (json) { handle(json, 0); },
+        function (e) { done(null, 'источник «' + info.bal + '» не ответил: ' + e); });
     };
 
     var card = s.card;
@@ -1295,8 +1337,11 @@
       if (session !== s) return;
       s.vidFps = vf;
       var ref = s.found && s.found.en && s.found.en[0];
-      s.palScale = palScale(ref && parseFloat(ref.fps), vf);
-      if (s.palScale !== 1) log('кадры: субтитры', ref.fps, 'видео', vf, '→ ×' + s.palScale.toFixed(4));
+      // эталон — английские; если их нет — сам файл показываемых субтитров
+      var bgT = s.bg && findTrack(s.bg);
+      var refFps = (ref && parseFloat(ref.fps)) || (bgT && bgT.os_fps) || 0;
+      s.palScale = palScale(refFps, vf);
+      if (s.palScale !== 1) log('кадры: субтитры', refFps, 'видео', vf, '→ ×' + s.palScale.toFixed(4));
       runDuration();
     });
   }
@@ -1311,6 +1356,7 @@
   var AUDIO_STEP = 0.1;
   var AUDIO_WIN = 480; // секунд звука в одной проверке (на реальных сериалах 3 минут мало)
   var AUDIO_MIN = 240;
+  var AUDIO_TARGET = 360; // столько слушаем до показа без уверенности (это же 100% на иконке)
 
   function audioStop() {
     if (!audio) return;
@@ -1404,7 +1450,7 @@
     var s0 = session;
     var track = (s0 && s0.waiting && s0.bg && findTrack(s0.bg)) || isShowing();
     if (!a || !track || !track.os_id || !texts[track.os_id]) return;
-    if (s0 && s0.waiting && Date.now() - s0.waiting > 12 * 60 * 1000) return finishBackground('долго нет результата');
+    if (s0 && s0.waiting && Date.now() - s0.waiting > 7 * 60 * 1000) return finishBackground('долго нет результата');
     var vs0 = videoSync();
     if (vs0.manual) {
       a.status = 'не нужна: поправка выставлена вручную';
@@ -1498,7 +1544,7 @@
     if (!agree && (z1 < need || z2 > z1 * 0.7)) {
       a.status = 'слушает ' + Math.round(tEnd - tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
       // полное окно прослушано, а уверенности нет — показываем как есть
-      if (s0 && s0.waiting && tEnd - tStart >= AUDIO_WIN - 5) finishBackground('нет уверенности');
+      if (s0 && s0.waiting && tEnd - tStart >= AUDIO_TARGET) finishBackground('нет уверенности');
       return;
     }
     a.status = 'последняя проверка: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с (уверенность ' + z1.toFixed(1) + ')';
@@ -1715,15 +1761,61 @@
   var CC_PATH = 'M9.50 8.37A2.7 2.7 0 1 0 9.50 12.63M15.86 8.37A2.7 2.7 0 1 0 15.86 12.63';
   var ccSeq = 0;
 
+  // Контур — субтитры выключены; заливка снизу вверх — прогресс (поиск, скачивание, проверка по звуку);
+  // полная заливка — включены. Заливка обрезается прямоугольником clipPath, высоту которого двигает ccTick.
   function ccIcon() {
-    var id = 'ops-cc-mask-' + (++ccSeq);
+    var n = ++ccSeq;
     return '<svg viewBox="0 0 21 21" fill="none">' +
-      '<defs><mask id="' + id + '"><rect x="0" y="0" width="21" height="21" fill="#fff"/>' +
-      '<path d="' + CC_PATH + '" stroke="#000" stroke-width="2.3" stroke-linecap="round"/></mask></defs>' +
-      '<g class="ops-cc-off"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
+      '<defs><mask id="ops-cc-mask-' + n + '"><rect x="0" y="0" width="21" height="21" fill="#fff"/>' +
+      '<path d="' + CC_PATH + '" stroke="#000" stroke-width="2.3" stroke-linecap="round"/></mask>' +
+      '<clipPath id="ops-cc-clip-' + n + '"><rect class="ops-cc-cliprect" x="0" y="21" width="21" height="0"/></clipPath>' +
+      '<clipPath id="ops-cc-rest-' + n + '"><rect class="ops-cc-restrect" x="0" y="0" width="21" height="21"/></clipPath></defs>' +
+      '<g class="ops-cc-off" clip-path="url(#ops-cc-rest-' + n + ')"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
       '<path d="' + CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></g>' +
-      '<g class="ops-cc-on"><rect x="0" y="2.5" width="21" height="16" rx="4.4" fill="currentColor" mask="url(#' + id + ')"/></g>' +
+      '<g class="ops-cc-on" clip-path="url(#ops-cc-clip-' + n + ')"><rect x="0" y="2.5" width="21" height="16" rx="4.4" fill="currentColor" mask="url(#ops-cc-mask-' + n + ')"/></g>' +
       '</svg>';
+  }
+
+  var ccAnim = { p: 0, target: 0, loop: false, t0: 0, timer: null };
+
+  function ccTick() {
+    var tgt = ccAnim.target;
+    if (ccAnim.loop) {
+      var ph = ((Date.now() - ccAnim.t0) % 1800) / 1800;
+      tgt = ph < 0.5 ? ph * 2 : 2 - ph * 2; // заполняется и опустошается, пока идёт работа без известного прогресса
+    }
+    ccAnim.p += (tgt - ccAnim.p) * 0.2;
+    if (Math.abs(tgt - ccAnim.p) < 0.004) ccAnim.p = tgt;
+    // залитая рамка занимает по высоте 2.5…18.5 единиц сетки — заполняем её снизу вверх
+    var h = 16 * ccAnim.p;
+    var rects = document.querySelectorAll('.ops-cc-cliprect');
+    for (var i = 0; i < rects.length; i++) {
+      rects[i].setAttribute('y', String(18.5 - h));
+      rects[i].setAttribute('height', String(h));
+    }
+    // контур виден только над заливкой
+    var rest = document.querySelectorAll('.ops-cc-restrect');
+    for (var j = 0; j < rest.length; j++) rest[j].setAttribute('height', String(ccAnim.p >= 1 ? 0 : 18.5 - h));
+    if (!ccAnim.loop && ccAnim.p === tgt) {
+      clearInterval(ccAnim.timer);
+      ccAnim.timer = null;
+    }
+  }
+
+  function setCcFill(p, loop) {
+    if (loop && !ccAnim.loop) ccAnim.t0 = Date.now() - (ccAnim.p * 900); // продолжаем с текущего уровня
+    ccAnim.loop = !!loop;
+    ccAnim.target = Math.max(0, Math.min(1, p));
+    if (!ccAnim.timer) ccAnim.timer = setInterval(ccTick, 40);
+  }
+
+  function audioProgress() {
+    if (!audio || !audio.samples.length) return 0;
+    var seg = audio.samples[audio.samples.length - 1].s;
+    var first = null, last = 0;
+    for (var i = audio.samples.length - 1; i >= 0 && audio.samples[i].s === seg; i--) first = audio.samples[i].t;
+    last = audio.samples[audio.samples.length - 1].t;
+    return first === null ? 0 : Math.min(0.97, (last - first) / AUDIO_TARGET);
   }
 
   var ICON = '<svg viewBox="0 0 21 21" fill="none"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
@@ -1734,10 +1826,7 @@
     var sel = '.player-video__subtitles';
     var rules = [
       'body.ops-has-btn .player-panel__subs{display:none !important}',
-      '.ops-btn .ops-cc-on{display:none}',
-      '.ops-btn.ops-on .ops-cc-on{display:inline}',
-      '.ops-btn.ops-on .ops-cc-off{display:none}',
-      '.ops-btn.ops-pending svg{opacity:.5}',
+
       'body.ops-shadow-none ' + sel + '{text-shadow:none !important}',
       'body.ops-shadow-none ' + sel + ' .player-video__subtitles-text{background:none !important}',
       'body.ops-shadow-soft ' + sel + '{text-shadow:0 0.05em 0.15em rgba(0,0,0,.95),0 0 0.5em rgba(0,0,0,.7) !important}',
@@ -1919,8 +2008,12 @@
       btns[i].classList.toggle('ops-on', on);
       btns[i].classList.toggle('ops-pending', pending && !on);
       var tip = btns[i].querySelector('.tooltip');
-      if (tip) tip.textContent = on ? 'Выключить субтитры' : waiting ? 'Субтитры синхронизируются по звуку — нажмите, чтобы включить сразу' : 'Включить субтитры';
+      if (tip) tip.textContent = on ? 'Выключить субтитры' : waiting ? 'Сверяю субтитры со звуком: ' + Math.round(audioProgress() * 100) + '% — нажмите, чтобы включить сразу' : pending ? 'Готовлю субтитры…' : 'Включить субтитры';
     }
+    if (on) setCcFill(1, false);
+    else if (waiting && audio && audio.samples.length) setCcFill(audioProgress(), false); // известный прогресс
+    else if (pending) setCcFill(0, true);
+    else setCcFill(0, false);
   }
 
   function openSettingsMenu() {
