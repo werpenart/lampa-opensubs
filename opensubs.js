@@ -310,7 +310,8 @@
       if (/\((en|eng)\)|\beng\b|english|англ/i.test(t)) return 'en';
       if (/\((uk|ua|ukr)\)|\bukr\b|україн|украин/i.test(t)) return 'uk';
       if (/\((ru|rus)\)|\brus\b|русск/i.test(t)) return 'ru';
-      if (/оригинал|оригінал|original/i.test(t)) return normLang(card.original_language) || 'en';
+      // «Субтитры», «Укр. Субтитры» у источников — оригинальная дорожка с вшитым переводом
+      if (/оригинал|оригінал|original|субтитр|субтитл/i.test(t)) return normLang(card.original_language) || 'en';
       if (/\b(dub|mvo|avo|dvo)\b|дубл|многогол|двухгол|одногол|закадр|профессион|любительск/i.test(t)) return 'ru';
     }
     return null;
@@ -379,6 +380,7 @@
     }
 
     var langs = langOrder(s);
+    if (langs.indexOf('en') < 0) langs.push('en'); // английские — эталон для автосинхронизации
     var p = buildQuery(card, data, langs);
     if (!p) return log('нет номера серии');
 
@@ -462,7 +464,10 @@
         updateButtons();
         ensureTrack(cand[0], function (t) {
           s.pending = false;
-          if (session === s && ccWanted()) showTrack(t);
+          if (session === s && ccWanted()) {
+            showTrack(t);
+            maybeAutoSync(t);
+          }
           updateButtons();
         }, function () {
           s.pending = false;
@@ -566,13 +571,13 @@
 
   function getSync(fid) {
     var c = syncAll()[fid];
-    return { scale: (c && c.scale) || 1, offset: (c && c.offset) || 0, anchors: (c && c.anchors) || [] };
+    return { scale: (c && c.scale) || 1, offset: (c && c.offset) || 0, anchors: (c && c.anchors) || [], auto: !!(c && c.auto), known: !!c };
   }
 
   function setSync(fid, sync) {
     var all = syncAll();
-    if (sync.scale === 1 && !sync.offset && !sync.anchors.length) delete all[fid];
-    else all[fid] = { scale: sync.scale, offset: Math.round(sync.offset * 1000) / 1000, anchors: sync.anchors.slice(-4), t: Date.now() };
+    if (sync.scale === 1 && !sync.offset && !sync.anchors.length && !sync.auto) delete all[fid];
+    else all[fid] = { scale: sync.scale, offset: Math.round(sync.offset * 1000) / 1000, anchors: sync.anchors.slice(-4), auto: !!sync.auto, t: Date.now() };
     var keys = Object.keys(all);
     if (keys.length > 300) {
       keys.sort(function (a, b) { return (all[a].t || 0) - (all[b].t || 0); });
@@ -674,6 +679,110 @@
     return !!far;
   }
 
+  // ---------- автосинхронизация по английским субтитрам ----------
+  // Реплики одного фильма на разных языках начинаются почти в одни моменты. Перебираем пересчёты частоты кадров
+  // и для каждого строим гистограмму разниц «эталон − перевод»: пик даёт сдвиг, высота пика — качество совпадения.
+
+  var SCALES = [1, 25 / 23.976, 23.976 / 25, 24 / 23.976, 23.976 / 24, 25 / 24, 24 / 25];
+
+  function cueStarts(text, sync) {
+    var c = parseCues(text);
+    var out = [];
+    for (var i = 0; i < c.length; i++) out.push(sync ? c[i].start * sync.scale + sync.offset : c[i].start);
+    return out.sort(function (a, b) { return a - b; });
+  }
+
+  function matchTimings(ref, tgt) {
+    var BIN = 0.2, WIN = 300;
+    var best = null;
+    for (var si = 0; si < SCALES.length; si++) {
+      var sc = SCALES[si];
+      var hist = {};
+      var lo = 0;
+      for (var i = 0; i < tgt.length; i++) {
+        var x = tgt[i] * sc;
+        while (lo < ref.length && ref[lo] < x - WIN) lo++;
+        for (var j = lo; j < ref.length && ref[j] <= x + WIN; j++) {
+          var k = Math.round((ref[j] - x) / BIN);
+          hist[k] = (hist[k] || 0) + 1;
+        }
+      }
+      for (var key in hist) {
+        var kk = parseInt(key, 10);
+        var score = hist[kk] + (hist[kk - 1] || 0) + (hist[kk + 1] || 0);
+        if (!best || score > best.score) best = { scale: sc, k: kk, score: score };
+      }
+    }
+    if (!best) return null;
+
+    // уточняем сдвиг медианой разниц вокруг пика
+    var ds = [];
+    var lo2 = 0;
+    for (var a = 0; a < tgt.length; a++) {
+      var y = tgt[a] * best.scale;
+      while (lo2 < ref.length && ref[lo2] < y + best.k * BIN - 0.5) lo2++;
+      for (var b = lo2; b < ref.length && ref[b] <= y + best.k * BIN + 0.5; b++) {
+        var d = ref[b] - y;
+        if (Math.abs(d - best.k * BIN) <= 0.4) ds.push(d);
+      }
+    }
+    ds.sort(function (p, q) { return p - q; });
+    best.offset = ds.length ? ds[Math.floor(ds.length / 2)] : best.k * BIN;
+    best.ratio = best.score / Math.max(1, Math.min(ref.length, tgt.length));
+    return best;
+  }
+
+  // done(result|null, reason)
+  function autoSync(track, done) {
+    var s = session;
+    var fid = track.os_id;
+    var ref = s && s.found.en && s.found.en[0];
+    if (!fid || !texts[fid]) return done(null, 'нет файла');
+    if (!ref) return done(null, 'нет английских субтитров для сравнения');
+    var rid = ref.files[0].file_id;
+    if (rid === fid) return done(null, 'это и есть английские');
+
+    download(rid, function (text) {
+      if (!text) return done(null, 'не удалось скачать английские');
+      texts[rid] = texts[rid] || text;
+      setTimeout(function () {
+        var res = matchTimings(cueStarts(text, getSync(rid)), cueStarts(texts[fid]));
+        if (!res || res.score < 40 || res.ratio < 0.3) return done(null, 'файлы слишком разные');
+        var sync = { scale: res.scale, offset: res.offset, anchors: [], auto: true };
+        if (findTrack(fid)) resync(findTrack(fid), sync);
+        else setSync(fid, sync);
+        done(res);
+      }, 30);
+    }, function () {
+      done(null, 'не удалось скачать английские');
+    });
+  }
+
+  function describeAuto(res) {
+    var parts = [];
+    for (var i = 0; i < FPS.length; i++) {
+      if (FPS[i].scale !== 1 && Math.abs(FPS[i].scale - res.scale) < 0.0005) parts.push('кадры ' + FPS[i].title.split(' (')[0]);
+    }
+    parts.push('сдвиг ' + (res.offset > 0 ? '+' : '') + res.offset.toFixed(1) + ' с');
+    return parts.join(', ');
+  }
+
+  // при первом включении неанглийских субтитров — выровнять по английским (один раз на файл)
+  function maybeAutoSync(track) {
+    if (!flag('autosync', true) || !track || !track.os_id || track.language === 'en') return;
+    var sync = getSync(track.os_id);
+    if (sync.known) return; // уже выравнивали или пользователь правил вручную
+    autoSync(track, function (res, reason) {
+      if (res) {
+        log('автосинхронизация', describeAuto(res), 'совпадение', res.ratio.toFixed(2));
+        if (Math.abs(res.offset) > 0.3 || res.scale !== 1) notify('Субтитры выровнены: ' + describeAuto(res));
+      } else {
+        log('автосинхронизация не удалась:', reason);
+        setSync(track.os_id, { scale: 1, offset: 0, anchors: [], auto: true }); // не пробовать снова
+      }
+    });
+  }
+
   var FPS = [
     { title: 'Без изменений', scale: 1 },
     { title: '25 → 23.976 (субтитры спешат и уползают)', scale: 25 / 23.976 },
@@ -706,6 +815,7 @@
       title: 'Синхронизация',
       nohide: true,
       items: [
+        { title: 'Автоматически', subtitle: 'Выровнять по английским субтитрам: сдвиг и частота кадров', name: 'auto' },
         { title: 'По фразе', subtitle: 'Выберите реплику, которая звучит сейчас. Сделайте так в начале и через 10+ минут — поправится и скорость', name: 'phrase' },
         { title: 'Сдвиг', subtitle: syncTitle(sync), name: 'shift' },
         { title: 'Частота кадров', subtitle: 'Если субтитры уползают всё дальше', name: 'fps' },
@@ -714,6 +824,14 @@
       onBack: back,
       onSelect: function (a) {
         if (a.name === 'phrase') return phraseMenu(track, reopen, root);
+
+        if (a.name === 'auto') {
+          Lampa.Noty.show('Сравниваю с английскими субтитрами…');
+          autoSync(track, function (res, reason) {
+            Lampa.Noty.show(res ? 'Выровнено: ' + describeAuto(res) : 'Не получилось: ' + reason);
+          });
+          return root();
+        }
 
         if (a.name === 'shift') {
           closeSelects();
@@ -986,9 +1104,10 @@
               } else if (b.track) {
                 setCc(true);
                 showTrack(b.track);
+                maybeAutoSync(b.track);
               } else if (b.cand) {
                 setCc(true);
-                ensureTrack(b.cand, function (t) { showTrack(t); }, function () {
+                ensureTrack(b.cand, function (t) { showTrack(t); maybeAutoSync(t); }, function () {
                   Lampa.Noty.show('Не удалось скачать субтитры');
                 });
               }
@@ -1139,6 +1258,12 @@
         default: 'ru,uk,en'
       },
       field: { name: 'Запасные языки', description: 'Если на языке озвучки субтитров нет' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_autosync', type: 'trigger', default: true },
+      field: { name: 'Автосинхронизация', description: 'Выравнивать русские и украинские субтитры по английским (ещё одно скачивание на фильм)' }
     });
 
     Lampa.SettingsApi.addParam({
