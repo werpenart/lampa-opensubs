@@ -611,10 +611,17 @@
     return String(bal).toLowerCase() + '|' + String(voice).toLowerCase().replace(/\s+/g, ' ').trim();
   }
 
+  // студия озвучки: «LostFilm», «HDRezka Studio», «Кубик в Кубе»… — заставка у студии одна на все сериалы
+  function studioKey(s) {
+    var v = [typeof s.data.translate === 'string' ? s.data.translate : '', s.data.voice_name || ''].join(' ').toLowerCase();
+    v = v.replace(/\b(\d{3,4}p|4k|uhd|hdr|sdr|fhd|hd)\b|\(.*?\)|[|·•\-_.,]/g, ' ').replace(/\s+/g, ' ').trim();
+    return v ? 'studio|' + v : '';
+  }
+
   function videoKeys(s) {
     var src = s.card.id + '|' + sourceKey(s);
     var ep = episodeInfo(s.data);
-    return { exact: src + (ep ? '|' + ep.season + 'x' + ep.episode : ''), source: src };
+    return { exact: src + (ep ? '|' + ep.season + 'x' + ep.episode : ''), source: src, studio: studioKey(s) };
   }
 
   function videoSync() {
@@ -623,11 +630,13 @@
     if (!s.vsync) {
       var k = videoKeys(s);
       var c = store('opensubs_vsync')[k.exact];
-      var prior = !c && store('opensubs_vprior')[k.source];
-      // другая серия того же источника: заставка обычно та же — берём как стартовую точку
+      var pr = store('opensubs_vprior');
+      // другая серия того же источника, затем любой сериал этой студии: заставка обычно та же
+      var prior = !c && (pr[k.source] || (k.studio && pr[k.studio]));
       s.vsync = c ? { scale: c.scale, offset: c.offset, anchors: c.anchors || [] }
-        : prior ? { scale: prior.scale, offset: prior.offset, anchors: [], prior: true }
+        : prior ? { scale: pr[k.source] ? prior.scale : 1, offset: prior.offset, anchors: [], prior: pr[k.source] ? 'source' : 'studio' }
         : { scale: 1, offset: 0, anchors: [] };
+      if (prior) log('поправка из', s.vsync.prior, s.vsync.offset);
     }
     return s.vsync;
   }
@@ -645,6 +654,8 @@
     } else {
       all[k.exact] = { scale: v.scale, offset: round3(v.offset), anchors: v.anchors.slice(-8), t: Date.now() };
       pr[k.source] = { scale: v.scale, offset: round3(v.offset), t: Date.now() };
+      // студии запоминаем только сдвиг начала (заставку), скорость у разных сериалов своя
+      if (k.studio) pr[k.studio] = { scale: 1, offset: round3(v.offset + (v.anchors.length ? v.anchors[0].o * (v.scale - 1) : 0)), t: Date.now() };
     }
     storeSave('opensubs_vsync', all, 500);
     storeSave('opensubs_vprior', pr, 200);
@@ -896,6 +907,7 @@
   // и есть поправка. Так находится заставка студии (LostFilm, HDRezka…) и уползание из-за частоты кадров.
 
   var audio = null;
+  var audioDenied = ''; // почему подстройка по звуку не работает (для меню)
   var AUDIO_STEP = 0.1;
   var AUDIO_WIN = 180;
 
@@ -910,19 +922,27 @@
     if (!flag('audiosync', true)) return;
     var v = null;
     try { v = Lampa.PlayerVideo.video(); } catch (e) {}
-    if (!v || !v.captureStream) return; // mozCaptureStream в Firefox глушит звук видео — не используем
+    if (!v || !v.captureStream) { // mozCaptureStream в Firefox глушит звук видео — не используем
+      audioDenied = 'этот плеер не даёт доступ к звуку';
+      return;
+    }
+    audioDenied = '';
     if (audio && audio.video === v) return;
     audioStop();
 
     var Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return;
-    audio = { video: v, samples: [], seg: 0, lastT: -1, lastEval: 0, ctx: null, analyser: null, told: false, fails: 0 };
+    audio = { video: v, samples: [], seg: 0, lastT: -1, lastEval: 0, ctx: null, analyser: null, told: false, fails: 0, status: 'ждёт звук видео' };
     var a = audio;
 
     var connect = function () {
       if (a !== audio || a.analyser) return;
       var stream;
-      try { stream = v.captureStream(); } catch (e) { return audioStop(); } // чужой домен без CORS
+      try { stream = v.captureStream(); } catch (e) { // чужой домен без CORS
+        log('звук недоступен', e && e.message);
+        audioDenied = 'браузер не даёт читать звук этого видео (другой домен)';
+        return audioStop();
+      }
       if (!stream.getAudioTracks().length) return; // дорожка появится после начала воспроизведения
       try {
         a.ctx = a.ctx || new Ctx();
@@ -940,6 +960,7 @@
         if (a.ctx.state === 'suspended' && a.ctx.resume) a.ctx.resume();
       } catch (e) {
         log('звук недоступен', e && e.message);
+        audioDenied = 'ошибка анализа звука: ' + (e && e.message);
         audioStop();
       }
     };
@@ -961,6 +982,7 @@
         total += p;
         if (f >= 300 && f <= 3400) speech += p;
       }
+      if (!a.evals) a.status = 'слушает: ' + Math.round(a.samples.length / 10) + ' с из 120 нужных';
       a.samples.push({ t: t, e: total > 0 ? Math.log(speech + 1e-12) + 2 * (speech / total) : -30, s: a.seg });
       if (a.samples.length > 6000) a.samples.splice(0, a.samples.length - 6000);
       if (Date.now() - a.lastEval > 30000) {
@@ -1001,7 +1023,7 @@
     var c = composed(track.os_id);
     var cues = parseCues(texts[track.os_id]);
     var vs = videoSync();
-    var dmax = vs.anchors.length ? 20 : 90;
+    var dmax = vs.anchors.length ? 20 : vs.prior ? 15 : 90;
     var D = Math.round(dmax / AUDIO_STEP);
     var len = n + 2 * D;
     var ind = new Float32Array(len); // показ субтитров на сетке [tStart − dmax, tEnd + dmax]
@@ -1033,7 +1055,13 @@
     var z2 = (second - sm) / sd;
     var shift = bestD * AUDIO_STEP;
     log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1));
-    if (z1 < 4.5 || z2 > z1 * 0.8) return; // нет уверенности
+    a.evals = (a.evals || 0) + 1;
+    var need = dmax <= 20 ? 3.8 : 4.5; // при узком поиске хватает меньшей уверенности
+    if (z1 < need || z2 > z1 * 0.8) {
+      a.status = 'слушает ' + Math.round(tEnd - tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
+      return;
+    }
+    a.status = 'последняя проверка: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с (уверенность ' + z1.toFixed(1) + ')';
 
     if (Math.abs(shift) < 0.25) return;
     var center = (tStart + tEnd) / 2;
@@ -1064,7 +1092,8 @@
     var parts = [];
     if (Math.abs(v.offset) >= 0.05) parts.push((v.offset > 0 ? '+' : '') + v.offset.toFixed(2) + ' сек.');
     if (Math.abs(v.scale - 1) > 0.0005) parts.push('скорость ×' + v.scale.toFixed(4));
-    return parts.length ? parts.join(', ') + ' для этого источника' : 'Без поправок для этого источника';
+    var from = v.prior === 'studio' ? ' (взято у студии озвучки)' : v.prior === 'source' ? ' (с прошлой серии)' : '';
+    return parts.length ? parts.join(', ') + ' для этого источника' + from : 'Без поправок для этого источника';
   }
 
   // back — вернуться в меню субтитров, root — закрыть всё и вернуться к просмотру
@@ -1081,7 +1110,7 @@
       title: 'Синхронизация',
       nohide: true,
       items: [
-        { title: 'Подстройка по звуку', subtitle: aud ? (audio && audio.analyser ? 'Включена: слушает речь и поправляет время' : 'Включена, но звук этого видео недоступен') : 'Выключена', name: 'audio' },
+        { title: 'Подстройка по звуку', subtitle: !aud ? 'Выключена' : audioDenied ? 'Не работает: ' + audioDenied : audio ? (audio.analyser ? audio.status : 'ждёт звук видео') : 'Не запущена', name: 'audio' },
         { title: 'По английским субтитрам', subtitle: 'Выровнять файл: частота кадров и сдвиг', name: 'auto' },
         { title: 'По фразе', subtitle: 'Выберите реплику, которая звучит сейчас', name: 'phrase' },
         { title: 'Сдвиг', subtitle: syncTitle(), name: 'shift' },
