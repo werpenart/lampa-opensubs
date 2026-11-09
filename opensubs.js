@@ -395,7 +395,7 @@
       if (session !== s) return;
       s.searching = false;
       s.found = groupFound(json.data || [], langs);
-      if (ccWanted()) turnOn(s, true);
+      if (ccWanted()) turnOn(s, true, s.userTap);
       updateButtons();
     }, function (status, json) {
       s.searching = false;
@@ -456,7 +456,50 @@
   }
 
   // включить субтитры на нужном языке: субтитры источника на этом языке, иначе лучший файл OpenSubtitles
-  function turnOn(s, auto) {
+  // Можно ли синхронизировать по звуку до показа (встроенный плеер с доступом к звуку)
+  function canListen() {
+    if (!flag('audiosync', true)) return false;
+    try {
+      var v = Lampa.PlayerVideo.video();
+      return !!(v && v.captureStream);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Автовключение: субтитры скачиваются и синхронизируются по звуку в фоне, а показываются, когда звук подтвердил время.
+  function startBackground(s, t) {
+    s.bg = t.os_id;
+    s.want = null; // Lampa по своим настройкам может включить дорожку сама — reassert её выключит
+    s.waiting = Date.now();
+    selectTrack(null);
+    log('фоновая синхронизация', t.label);
+    durationSync();
+    maybeAutoSync(t);
+    audioStart();
+    updateButtons();
+    if (!audio) return finishBackground('нет звука');
+    // звук так и не подключился (нет аудиодорожки, плеер не отдаёт) — не держим субтитры скрытыми
+    setTimeout(function () {
+      if (session === s && s.waiting && (!audio || !audio.analyser || !audio.samples.length)) finishBackground('звук не подключился');
+    }, 20000);
+  }
+
+  // проверка по звуку завершена (или невозможна) — показываем
+  function finishBackground(why) {
+    var s = session;
+    if (!s || !s.waiting) return;
+    s.waiting = 0;
+    var t = s.bg && findTrack(s.bg);
+    log('фон завершён:', why);
+    if (t && ccWanted()) {
+      showTrack(t);
+      if (why === 'ok') notify('Субтитры синхронизированы по звуку и включены');
+    }
+    updateButtons();
+  }
+
+  function turnOn(s, auto, immediate) {
     var langs = langOrder(s);
     for (var i = 0; i < langs.length; i++) {
       var src = sourceTrackFor([langs[i]]);
@@ -471,8 +514,11 @@
         ensureTrack(cand[0], function (t) {
           s.pending = false;
           if (session === s && ccWanted()) {
-            showTrack(t);
-            maybeAutoSync(t);
+            if (auto && !immediate && canListen() && !videoSync().manual) startBackground(s, t);
+            else {
+              showTrack(t);
+              maybeAutoSync(t);
+            }
           }
           updateButtons();
         }, function () {
@@ -493,7 +539,10 @@
   }
 
   function showTrack(track) {
-    if (session) session.want = track.os_id || track.label || track.index;
+    if (session) {
+      session.want = track.os_id || track.label || track.index;
+      session.waiting = 0; // показали — фоновое ожидание больше не нужно, звук продолжит доводить время
+    }
     selectTrack(track);
     updateButtons();
     if (track && track.os_id) {
@@ -503,7 +552,10 @@
   }
 
   function turnOff() {
-    if (session) session.want = null;
+    if (session) {
+      session.want = null;
+      session.waiting = 0;
+    }
     selectTrack(null);
     updateButtons();
   }
@@ -531,6 +583,7 @@
     setCc(true);
     var s = session;
     if (s && s.searching) {
+      s.userTap = true; // нажали сами — покажем сразу, как найдутся
       updateButtons();
       return Lampa.Noty.show('Ищу субтитры…');
     }
@@ -1198,7 +1251,8 @@
       try { stream = v.captureStream(); } catch (e) { // чужой домен без CORS
         log('звук недоступен', e && e.message);
         audioDenied = 'браузер не даёт читать звук этого видео (другой домен)';
-        return audioStop();
+        audioStop();
+        return finishBackground('нет доступа к звуку');
       }
       if (!stream.getAudioTracks().length) return; // дорожка появится после начала воспроизведения
       try {
@@ -1219,6 +1273,7 @@
         log('звук недоступен', e && e.message);
         audioDenied = 'ошибка анализа звука: ' + (e && e.message);
         audioStop();
+        finishBackground('ошибка звука');
       }
     };
 
@@ -1255,8 +1310,10 @@
 
   function audioEvaluate() {
     var a = audio;
-    var track = isShowing();
+    var s0 = session;
+    var track = (s0 && s0.waiting && s0.bg && findTrack(s0.bg)) || isShowing();
     if (!a || !track || !track.os_id || !texts[track.os_id]) return;
+    if (s0 && s0.waiting && Date.now() - s0.waiting > 12 * 60 * 1000) return finishBackground('долго нет результата');
     var vs0 = videoSync();
     if (vs0.manual) {
       a.status = 'не нужна: поправка выставлена вручную';
@@ -1349,14 +1406,17 @@
     var agree = prevE && Math.abs(prevE.d - shift) <= 0.3 && prevE.z >= need - 0.5 && z1 >= need - 0.5 && z2 <= z1 * 0.7;
     if (!agree && (z1 < need || z2 > z1 * 0.7)) {
       a.status = 'слушает ' + Math.round(tEnd - tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
+      // полное окно прослушано, а уверенности нет — показываем как есть
+      if (s0 && s0.waiting && tEnd - tStart >= AUDIO_WIN - 5) finishBackground('нет уверенности');
       return;
     }
     a.status = 'последняя проверка: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с (уверенность ' + z1.toFixed(1) + ')';
 
-    if (Math.abs(shift) < 0.25) return;
+    if (Math.abs(shift) < 0.25) return finishBackground('ok');
     var center = (tStart + tEnd) / 2;
     var o = (center - vs.offset) / vs.scale;
     addAnchor(o, center + shift, 'audio');
+    finishBackground('ok');
     if (!a.told && Math.abs(shift) >= 1) {
       a.told = true;
       notify('Субтитры подстроены по звуку: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с');
@@ -1761,13 +1821,14 @@
 
   function updateButtons() {
     var on = !!isShowing();
-    var pending = !!(session && (session.pending || (session.searching && ccWanted())));
+    var waiting = !!(session && session.waiting);
+    var pending = !!(session && (session.pending || waiting || (session.searching && ccWanted())));
     var btns = document.querySelectorAll('.ops-btn');
     for (var i = 0; i < btns.length; i++) {
-      btns[i].classList.toggle('ops-on', on || pending);
+      btns[i].classList.toggle('ops-on', on);
       btns[i].classList.toggle('ops-pending', pending && !on);
       var tip = btns[i].querySelector('.tooltip');
-      if (tip) tip.textContent = on ? 'Выключить субтитры' : 'Включить субтитры';
+      if (tip) tip.textContent = on ? 'Выключить субтитры' : waiting ? 'Субтитры синхронизируются по звуку — нажмите, чтобы включить сразу' : 'Включить субтитры';
     }
   }
 
