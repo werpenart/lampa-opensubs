@@ -185,19 +185,18 @@
     r.send(null);
   }
 
-  // done(url): blob-ссылка на сохранённый файл, либо прямая ссылка, если хранилище недоступно
+  // done(text, link): текст файла (из хранилища или свежескачанный); link — прямая ссылка, если текст получить не удалось
   function download(fileId, done, fail) {
     storeGet(fileId, function (text) {
-      var u = text && textUrl(text);
-      if (u) return done(u);
+      if (text) return done(text, null);
 
       xhr('POST', API + '/download', { file_id: fileId, sub_format: 'webvtt' }, function (json) {
         if (!json.link) return fail(json);
         fetchText(json.link, function (body) {
           storePut(fileId, body);
-          done(textUrl(body) || json.link);
+          done(body, null);
         }, function () {
-          done(json.link);
+          done(null, json.link);
         });
       }, function (status, json) {
         fail(json || status);
@@ -256,21 +255,36 @@
     return p;
   }
 
-  // лучшие N на язык: живые переводы, без пометок для слабослышащих, по числу скачиваний
+  // Экранки и ранние релизы: свой хронометраж, с онлайн-видео не совпадают
+  var BAD_RELEASE = /(^|[^a-z])(cam|hdcam|camrip|ts|hdts|telesync|tc|hdtc|telecine|scr|screener|dvdscr|bdscr|workprint|r5)([^a-z]|$)/i;
+  // Финальные релизы: онлайн-источники обычно сделаны из них
+  var GOOD_RELEASE = /blu-?ray|bdrip|brrip|bdremux|remux|web-?dl|webrip|web|amzn|nf|dsnp|hmax|atvp|itunes|hdrip|dvdrip/i;
+
+  function score(a) {
+    var rel = String(a.release || '') + ' ' + String((a.files[0] && a.files[0].file_name) || '');
+    var sc = Math.log(1 + (a.download_count || 0)); // 0…~14
+    if (BAD_RELEASE.test(rel)) sc -= 100;
+    if (GOOD_RELEASE.test(rel)) sc += 6;
+    if (a.from_trusted) sc += 3;
+    var fps = parseFloat(a.fps) || 0;
+    if (fps && Math.abs(fps - 23.976) > 0.1 && Math.abs(fps - 24) > 0.1) sc -= 4; // 25/29.97/30 — чаще всего не наш хронометраж
+    if (a.hearing_impaired) sc -= 2;
+    return sc;
+  }
+
+  // лучшие N на язык: живые переводы, финальные релизы, затем по популярности
   function pick(list, langs, perLang) {
     var groups = {};
     for (var i = 0; i < list.length; i++) {
       var a = list[i].attributes;
       if (!a || !a.files || !a.files.length) continue;
       if (a.machine_translated || a.ai_translated) continue;
+      a._score = score(a);
       (groups[a.language] = groups[a.language] || []).push(a);
     }
     var out = [];
     for (var j = 0; j < langs.length; j++) {
-      var g = (groups[langs[j]] || []).sort(function (x, y) {
-        if (!!x.hearing_impaired !== !!y.hearing_impaired) return x.hearing_impaired ? 1 : -1;
-        return (y.download_count || 0) - (x.download_count || 0);
-      });
+      var g = (groups[langs[j]] || []).sort(function (x, y) { return y._score - x._score; });
       out = out.concat(g.slice(0, perLang));
     }
     return out;
@@ -360,18 +374,25 @@
       var chosen = pick(json.data || [], langs, parseInt(setting('perlang', '1'), 10) || 1);
       if (!chosen.length) return log('ничего не найдено', p);
 
-      var items = [];
+      var slots = [];
       var left = chosen.length;
-      var finish = function () { if (--left === 0) inject(token, items); };
+      var finish = function () {
+        if (--left > 0) return;
+        inject(token, slots.filter(function (x) { return x; }));
+      };
 
-      chosen.forEach(function (a) {
-        download(a.files[0].file_id, function (link) {
-          items.push({
+      chosen.forEach(function (a, k) {
+        var fid = a.files[0].file_id;
+        download(fid, function (text, link) {
+          if (text) texts[fid] = text;
+          var url = text ? textUrl(applySync(text, getSync(fid))) : link;
+          if (url) slots[k] = {
             label: (LANG_NAMES[a.language] || a.language) + ' · OS · ' + shortRelease(a),
-            url: link,
+            url: url,
             language: a.language,
-            opensubs: true
-          });
+            opensubs: true,
+            os_id: fid
+          };
           finish();
         }, function (err) {
           log('download fail', err);
@@ -383,6 +404,277 @@
       });
     }, function (status, json) {
       log('search fail', status, json);
+    });
+  }
+
+  // ---------- синхронизация ----------
+  // Время в файле пересчитывается: t' = t * scale + offset. Параметры хранятся по file_id,
+  // поэтому при повторном просмотре синхронизация сохраняется.
+
+  var texts = {}; // file_id → исходный текст VTT (для пересчёта)
+
+  function syncAll() {
+    var c = Lampa.Storage.get('opensubs_sync', '{}');
+    if (typeof c === 'string') try { c = JSON.parse(c); } catch (e) { c = {}; }
+    return c && typeof c === 'object' ? c : {};
+  }
+
+  function getSync(fid) {
+    var c = syncAll()[fid];
+    return { scale: (c && c.scale) || 1, offset: (c && c.offset) || 0, anchors: (c && c.anchors) || [] };
+  }
+
+  function setSync(fid, sync) {
+    var all = syncAll();
+    if (sync.scale === 1 && !sync.offset && !sync.anchors.length) delete all[fid];
+    else all[fid] = { scale: sync.scale, offset: Math.round(sync.offset * 1000) / 1000, anchors: sync.anchors.slice(-4), t: Date.now() };
+    var keys = Object.keys(all);
+    if (keys.length > 300) {
+      keys.sort(function (a, b) { return (all[a].t || 0) - (all[b].t || 0); });
+      for (var i = 0; i < keys.length - 300; i++) delete all[keys[i]];
+    }
+    Lampa.Storage.set('opensubs_sync', all);
+  }
+
+  function parseTime(h, m, sec, ms) {
+    return (parseInt(h || '0', 10) * 3600) + parseInt(m, 10) * 60 + parseInt(sec, 10) + parseInt(ms, 10) / 1000;
+  }
+
+  function fmtTime(t) {
+    if (t < 0) t = 0;
+    var ms = Math.round(t * 1000);
+    var h = Math.floor(ms / 3600000); ms -= h * 3600000;
+    var m = Math.floor(ms / 60000); ms -= m * 60000;
+    var sec = Math.floor(ms / 1000); ms -= sec * 1000;
+    var p = function (n, l) { n = String(n); while (n.length < l) n = '0' + n; return n; };
+    return p(h, 2) + ':' + p(m, 2) + ':' + p(sec, 2) + '.' + p(ms, 3);
+  }
+
+  var TIME_RX = /(?:(\d{1,2}):)?(\d{2}):(\d{2})[.,](\d{3})/g;
+
+  function applySync(text, sync) {
+    if (sync.scale === 1 && !sync.offset) return text;
+    return text.replace(/^.*-->.*$/gm, function (line) {
+      return line.replace(TIME_RX, function (all, h, m, sec, ms) {
+        return fmtTime(parseTime(h, m, sec, ms) * sync.scale + sync.offset);
+      });
+    });
+  }
+
+  // реплики исходного файла: [{start, text}]
+  function parseCues(text) {
+    var out = [];
+    var blocks = String(text).replace(/\r/g, '').split(/\n\n+/);
+    for (var i = 0; i < blocks.length; i++) {
+      var lines = blocks[i].split('\n');
+      for (var j = 0; j < lines.length; j++) {
+        if (lines[j].indexOf('-->') < 0) continue;
+        TIME_RX.lastIndex = 0;
+        var m = TIME_RX.exec(lines[j]);
+        if (!m) break;
+        var body = lines.slice(j + 1).join(' ').replace(/<[^>]+>|\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim();
+        if (body) out.push({ start: parseTime(m[1], m[2], m[3], m[4]), text: body });
+        break;
+      }
+    }
+    return out;
+  }
+
+  // заменить файл дорожки на пересчитанный и оставить её включённой
+  function resync(track, sync) {
+    var fid = track.os_id;
+    setSync(fid, sync);
+    var url = textUrl(applySync(texts[fid], sync));
+    var state = videoSubs();
+    if (!url || !state) return;
+    var list = state.subs.map(function (x) {
+      var copy = {};
+      for (var k in x) if (k !== 'mode' && k !== 'ready' && k !== 'selected') copy[k] = x[k];
+      if (x.os_id === fid) copy.url = url;
+      return copy;
+    });
+    Lampa.Player.subtitles(list);
+    var now = videoSubs();
+    if (now) for (var i = 0; i < now.subs.length; i++) {
+      if (now.subs[i].os_id === fid) {
+        now.subs[i].selected = true;
+        now.subs[i].mode = 'showing';
+        cueBox(true);
+      }
+    }
+  }
+
+  function videoTime() {
+    try { return Lampa.PlayerVideo.video().currentTime || 0; } catch (e) { return 0; }
+  }
+
+  // Пользователь выбрал реплику, которая звучит прямо сейчас. Одна точка — сдвиг,
+  // две точки далеко друг от друга — сдвиг и скорость (лечит «уползание» из-за разной частоты кадров).
+  function anchorSync(track, cue, at) {
+    var sync = getSync(track.os_id);
+    var target = Math.max(0, at - 0.3); // реакция зрителя
+    var anchors = sync.anchors.filter(function (x) { return Math.abs(x.o - cue.start) > 1; });
+    anchors.push({ o: cue.start, t: target });
+
+    var far = null;
+    for (var i = 0; i < anchors.length - 1; i++) {
+      if (Math.abs(anchors[i].o - cue.start) > 300 && (!far || Math.abs(anchors[i].o - cue.start) > Math.abs(far.o - cue.start))) far = anchors[i];
+    }
+    if (far) {
+      var scale = (target - far.t) / (cue.start - far.o);
+      if (scale > 0.9 && scale < 1.1) {
+        sync.scale = scale;
+        sync.offset = target - cue.start * scale;
+      } else {
+        far = null;
+      }
+    }
+    if (!far) sync.offset = target - cue.start * sync.scale;
+    sync.anchors = anchors;
+    resync(track, sync);
+    return !!far;
+  }
+
+  var FPS = [
+    { title: 'Без изменений', scale: 1 },
+    { title: '25 → 23.976 (субтитры спешат и уползают)', scale: 25 / 23.976 },
+    { title: '23.976 → 25 (субтитры отстают и уползают)', scale: 23.976 / 25 },
+    { title: '24 → 23.976', scale: 24 / 23.976 },
+    { title: '23.976 → 24', scale: 23.976 / 24 },
+    { title: '30 → 23.976', scale: 30 / 23.976 },
+    { title: '23.976 → 30', scale: 23.976 / 30 }
+  ];
+
+  var STEPS = [-5, -2, -1, -0.5, -0.25, 0.25, 0.5, 1, 2, 5];
+
+  function syncTitle(sync) {
+    var parts = [];
+    if (Math.abs(sync.offset) >= 0.05) parts.push((sync.offset > 0 ? '+' : '') + sync.offset.toFixed(2) + ' сек.');
+    if (Math.abs(sync.scale - 1) > 0.0005) parts.push('скорость ×' + sync.scale.toFixed(4));
+    return parts.length ? parts.join(', ') : 'Без коррекции';
+  }
+
+  // back — вернуться в меню субтитров, root — закрыть всё и вернуться к просмотру
+  function syncMenu(track, back, root) {
+    var sync = getSync(track.os_id);
+    var reopen = function () {
+      closeSelects();
+      syncMenu(track, back, root);
+    };
+
+    closeSelects();
+    Lampa.Select.show({
+      title: 'Синхронизация',
+      nohide: true,
+      items: [
+        { title: 'По фразе', subtitle: 'Выберите реплику, которая звучит сейчас. Сделайте так в начале и через 10+ минут — поправится и скорость', name: 'phrase' },
+        { title: 'Сдвиг', subtitle: syncTitle(sync), name: 'shift' },
+        { title: 'Частота кадров', subtitle: 'Если субтитры уползают всё дальше', name: 'fps' },
+        { title: 'Сбросить', subtitle: 'Вернуть исходный файл', name: 'reset' }
+      ],
+      onBack: back,
+      onSelect: function (a) {
+        if (a.name === 'phrase') return phraseMenu(track, reopen, root);
+
+        if (a.name === 'shift') {
+          closeSelects();
+          return Lampa.Select.show({
+            title: 'Сдвиг: ' + syncTitle(sync),
+            nohide: true,
+            items: STEPS.map(function (v) {
+              return { title: (v > 0 ? 'Позже на ' : 'Раньше на ') + Math.abs(v) + ' сек.', value: v };
+            }),
+            onBack: reopen,
+            onSelect: function (b) {
+              sync.offset += b.value;
+              sync.anchors = [];
+              resync(track, sync);
+              reopen();
+            }
+          });
+        }
+
+        if (a.name === 'fps') {
+          closeSelects();
+          return Lampa.Select.show({
+            title: 'Частота кадров',
+            nohide: true,
+            items: FPS.map(function (f) {
+              return { title: f.title, scale: f.scale, selected: Math.abs(f.scale - sync.scale) < 0.0005 };
+            }),
+            onBack: reopen,
+            onSelect: function (b) {
+              // сохраняем положение текущего момента, меняя только скорость
+              var t = videoTime();
+              var orig = (t - sync.offset) / sync.scale;
+              sync.scale = b.scale;
+              sync.offset = t - orig * b.scale;
+              sync.anchors = [];
+              resync(track, sync);
+              reopen();
+            }
+          });
+        }
+
+        if (a.name === 'reset') {
+          resync(track, { scale: 1, offset: 0, anchors: [] });
+          Lampa.Noty.show('Синхронизация сброшена');
+          return reopen();
+        }
+      }
+    });
+  }
+
+  function phraseMenu(track, reopen, root) {
+    var cues = parseCues(texts[track.os_id] || '');
+    if (!cues.length) {
+      Lampa.Noty.show('Не удалось прочитать файл субтитров');
+      return reopen();
+    }
+    var sync = getSync(track.os_id);
+    var at = videoTime();
+    var v = null;
+    try { v = Lampa.PlayerVideo.video(); } catch (e) {}
+    var wasPlaying = v && !v.paused;
+    if (wasPlaying) try { v.pause(); } catch (e) {}
+    var resume = function () {
+      if (wasPlaying) try { v.play(); } catch (e) {}
+    };
+
+    // реплики вокруг текущего момента по нынешней синхронизации; с запасом — субтитры могут сильно спешить
+    var shown = at * 1;
+    var near = 0;
+    for (var i = 0; i < cues.length; i++) {
+      if (cues[i].start * sync.scale + sync.offset <= shown) near = i;
+    }
+    var from = Math.max(0, near - 25);
+    var to = Math.min(cues.length, near + 15);
+    var items = [];
+    for (var j = from; j < to; j++) {
+      var tt = cues[j].start * sync.scale + sync.offset;
+      items.push({
+        title: cues[j].text.length > 90 ? cues[j].text.slice(0, 90) + '…' : cues[j].text,
+        subtitle: fmtTime(tt).slice(0, 8),
+        cue: cues[j],
+        selected: j === near
+      });
+    }
+
+    closeSelects();
+    Lampa.Select.show({
+      title: 'Какая фраза звучит сейчас?',
+      nohide: true,
+      items: items,
+      onBack: function () {
+        resume();
+        reopen();
+      },
+      onSelect: function (b) {
+        var both = anchorSync(track, b.cue, at);
+        Lampa.Noty.show(both ? 'Сдвиг и скорость подобраны' : 'Сдвиг подобран. Для точности повторите через 10+ минут');
+        resume();
+        root();
+      }
     });
   }
 
@@ -409,7 +701,6 @@
   var ICON = '<svg viewBox="1.5 1.5 21 21" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
     '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M7 15h4M15 15h2M7 11h2M13 11h4"/></svg>';
 
-  var SHIFTS = [-10, -5, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 5, 10];
 
   function css() {
     if (document.getElementById('opensubs-style')) return;
@@ -478,11 +769,6 @@
     cueBox(!!track);
   }
 
-  function shiftTitle(v) {
-    v = parseFloat(v) || 0;
-    return (v > 0 ? '+' : '') + v + ' сек.';
-  }
-
   // Новая Lampa складывает селекты в стек; закрываем всё и рисуем меню заново, чтобы подписи были свежими
   function closeSelects() {
     if (Lampa.Select.closeAll) Lampa.Select.closeAll();
@@ -501,7 +787,7 @@
         { title: 'Язык субтитров', subtitle: on ? (on.label || on.language || 'Дорожка') : (subs.length ? 'Выключены' : 'Нет субтитров'), name: 'lang' },
         { title: 'Размер шрифта', subtitle: titleOf(SIZES, setting('size', 'auto')), name: 'size' },
         { title: 'Тень шрифта', subtitle: titleOf(SHADOWS, setting('shadow', 'auto')), name: 'shadow' },
-        { title: 'Сдвиг по времени', subtitle: shiftTitle(Lampa.Storage.get('player_subs_shift_time', '0')), name: 'shift' }
+        { title: 'Синхронизация', subtitle: on && on.os_id ? syncTitle(getSync(on.os_id)) : 'Для субтитров OpenSubtitles', name: 'sync' }
       ],
       onBack: back,
       onSelect: function (a) {
@@ -549,19 +835,12 @@
           });
         }
 
-        if (a.name === 'shift') {
-          var now = parseFloat(Lampa.Storage.get('player_subs_shift_time', '0')) || 0;
-          closeSelects();
-          return Lampa.Select.show({
-            title: a.title,
-            items: SHIFTS.map(function (v) { return { title: shiftTitle(v), value: v, selected: v === now }; }),
-            nohide: true,
-            onBack: again,
-            onSelect: function (b) {
-              Lampa.Storage.set('player_subs_shift_time', String(b.value));
-              again();
-            }
-          });
+        if (a.name === 'sync') {
+          if (!on || !on.os_id || !texts[on.os_id]) {
+            Lampa.Noty.show('Сначала включите субтитры OpenSubtitles');
+            return again();
+          }
+          return syncMenu(on, again, back);
         }
       }
     });
