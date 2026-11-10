@@ -1566,7 +1566,8 @@ module.exports = {
  *   2. Ручная точка главнее всего: при ней остальные гипотезы, расходящиеся больше чем на 1.5 с, отброшены.
  *   3. Без якорей — кластер вокруг самой уверенной гипотезы: совместимы те, кто отличается не больше чем
  *      на 3·√(σ₁² + σ₂²). Сдвиг — среднее с весами 1/σ². Несовместимые — в rejected.
- *   4. Статус: verified — ручная точка или суммарная уверенность независимых семейств ≥ 0.8;
+ *   4. Статус: verified — ручная точка или суммарная уверенность независимых семейств ≥ 0.8, причём хотя бы
+ *      одно из них основное (длительность, звук, точка): FPS, таймлайн и профиль только поддерживают;
  *      кандидат вставки учитывается, только если его подтвердили звук или точка (ADR 3);
  *      estimated — суммарная уверенность ≥ 0.3; uncertain — гипотезы есть, но слабые или релиз
  *      структурно отличается (вырезано, другая версия) без якорей; failed — гипотез нет.
@@ -1578,6 +1579,7 @@ var types = require('./types');
 var insertion = require('../estimators/opening-insertion');
 
 var VERIFIED = 0.8;
+var SUPPORTING = { fps: true, timeline: true, profile: true };
 var ESTIMATED = 0.3;
 var CONFLICT_MS = 1500;
 var SPAN_MS = 300000;
@@ -1733,6 +1735,13 @@ function combined(used, confirmedOnly) {
     }
     var f = FAMILY[h.estimator] || h.estimator;
     fam[f] = Math.max(fam[f] || 0, c);
+  }
+  // частота кадров, таймлайн фильма и профиль соседней серии лишь поддерживают: одни они не подтверждают
+  // синхронизацию (одинаковый FPS бывает у разных монтажей, 23.976/24 путаются, VFR портит среднее)
+  if (confirmedOnly) {
+    var primary = false;
+    for (var p in fam) if (!SUPPORTING[p] && fam[p] > 0) primary = true;
+    if (!primary) return 0;
   }
   var miss = 1;
   for (var k in fam) miss *= 1 - fam[k];
@@ -2487,6 +2496,8 @@ module.exports = function (app) {
 
     var runDuration = function () {
     app.lampacApi.originals(app.lampacCtx(s), function (origs, reason) {
+      s.originals = origs;
+      s.originalsWhy = reason;
       if (app.session !== s) return;
       if (!origs.length) {
         s.durStatus = 'не удалось: ' + reason;
@@ -2576,6 +2587,39 @@ module.exports = function (app) {
       runDuration();
       app.measureVideoFps(s, 0);
     });
+  };
+
+  // Отчёт для приёмки (меню «Синхронизация» → «Отчёт»): всё, на чём основано решение, без консоли
+  app.syncReport = function syncReport() {
+    var s = app.session;
+    if (!s) return [{ title: 'Видео не запущено' }];
+    var sec = function (ms) { return (ms / 1000).toFixed(2) + ' с'; };
+    var key = app.videoKey(s);
+    var out = [];
+    out.push({ title: 'Источник и озвучка', subtitle: (key.balancer || '—') + ' · ' + (key.voice || '—') + (key.season ? ' · S' + key.season + 'E' + key.episode : ' · фильм') });
+    out.push({ title: 'Длительность видео', subtitle: s.probe && s.probe.durationMs ? sec(s.probe.durationMs) + (s.probe.exact ? ' (плейлист)' : ' (плеер)') + ' · ' + s.probe.source : 'неизвестна' });
+    out.push({ title: 'Частота кадров', subtitle: 'метка ' + (s.vidFps || '—') + ', замер ' + (s.fpsMeasured ? s.fpsMeasured.toFixed(2) : '—') + ', субтитры ' + (s.refFps || '—') });
+    out.push({ title: 'Оригиналы', subtitle: (s.originals || []).map(function (o) { return o.source + ' ' + sec(o.durationMs); }).join(', ') || (s.originalsWhy || 'не найдены') });
+    if (s.siblings && s.siblings.length) out.push({ title: 'Другие озвучки', subtitle: s.siblings.map(function (x) { return x.voice + ' ' + sec(x.durationMs); }).join(', ') });
+    out.push({ title: 'Диагностика релиза', subtitle: s.release ? s.release.cls + ': ' + s.release.text : (s.durStatus || '—') });
+    var m = s.model;
+    if (m) {
+      out.push({ title: 'Модель: ' + m.status + ' · ' + m['class'], subtitle: 'сдвиг ' + (m.pieces[0].offsetMs >= 0 ? '+' : '') + sec(m.pieces[0].offsetMs) +
+        ', ×' + m.pieces[0].scale.toFixed(4) + (m.pieces.length > 1 ? ', кусков ' + m.pieces.length : '') + ', уверенность ' + m.confidence });
+      m.used.forEach(function (h) {
+        out.push({ title: '✓ ' + h.estimator + ' · ' + h.kind, subtitle: (h.offsetMs >= 0 ? '+' : '') + sec(h.offsetMs) + ' ±' + sec(h.sigmaMs) + ', ' + h.confidence +
+          (h.evidence.length ? ' · ' + h.evidence.map(function (e) { return e.what + ' ' + e.value; }).join('; ').slice(0, 120) : '') });
+      });
+      m.rejected.forEach(function (h) {
+        out.push({ title: '✗ ' + h.estimator + ' · ' + h.kind + ' (отброшено)', subtitle: (h.offsetMs >= 0 ? '+' : '') + sec(h.offsetMs) + ', ' + h.confidence });
+      });
+    }
+    if (s.decision) out.push({ title: 'Решение: ' + s.decision.action + ' (правило ' + s.decision.rule + ')', subtitle: s.decision.reason });
+    var v = app.videoSync();
+    out.push({ title: 'Применено к видео', subtitle: (v.offset >= 0 ? '+' : '') + v.offset.toFixed(2) + ' с, ×' + v.scale.toFixed(4) + (v.manual ? ', вручную' : '') +
+      (s.vsyncLevel ? ', профиль: ' + s.vsyncLevel : ', профиль новый') + (v.anchors && v.anchors.length ? ', точек ' + v.anchors.length : '') });
+    out.push({ title: 'Звук', subtitle: app.audioDenied ? 'не работает: ' + app.audioDenied : app.audio ? app.audio.status : 'не запускался' });
+    return out;
   };
 
   // Фильм без оригинала (правило 4): укладываются ли реплики в длительность видео — слабая гипотеза
@@ -4192,7 +4236,8 @@ module.exports = function (app) {
         { title: 'По фразе', subtitle: 'Выберите реплику, которая звучит сейчас', name: 'phrase' },
         { title: 'Сдвиг', subtitle: app.syncTitle(), name: 'shift' },
         { title: 'Частота кадров видео', subtitle: 'Если субтитры уползают всё дальше', name: 'fps' },
-        { title: 'Сбросить для этого источника', subtitle: 'Убрать поправки под это видео', name: 'reset' }
+        { title: 'Сбросить для этого источника', subtitle: 'Убрать поправки под это видео', name: 'reset' },
+        { title: 'Отчёт для проверки', subtitle: 'На чём основана синхронизация этого видео', name: 'report' }
       ],
       onBack: back,
       onSelect: function (a) {
@@ -4262,6 +4307,11 @@ module.exports = function (app) {
               reopen();
             }
           });
+        }
+
+        if (a.name === 'report') {
+          app.closeSelects();
+          return Lampa.Select.show({ title: 'Отчёт синхронизации', nohide: true, items: app.syncReport(), onBack: reopen, onSelect: reopen });
         }
 
         if (a.name === 'reset') {
