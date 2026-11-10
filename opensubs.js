@@ -6,6 +6,402 @@
  */
 (function () {
   var defs = {
+  "api/http": function (module, exports, require) {
+/*
+ * HTTP для браузера (XMLHttpRequest). Модули получают его через create({ http }),
+ * тесты подставляют свой объект с тем же интерфейсом.
+ *   getText(url, done(text), fail(status|reason))
+ *   getJSON(url, done(json), fail(status|reason))
+ */
+'use strict';
+
+var TIMEOUT = 20000;
+
+function getText(url, done, fail) {
+  var r = new XMLHttpRequest();
+  r.open('GET', url, true);
+  r.timeout = TIMEOUT;
+  r.onload = function () {
+    if (r.status >= 200 && r.status < 300) done(r.responseText);
+    else fail(r.status);
+  };
+  r.onerror = r.ontimeout = function () { fail(0); };
+  r.send(null);
+}
+
+function getJSON(url, done, fail) {
+  getText(url, function (t) {
+    var j = null;
+    try { j = JSON.parse(t); } catch (e) {}
+    if (j) done(j);
+    else fail('json');
+  }, fail);
+}
+
+module.exports = { getText: getText, getJSON: getJSON };
+  },
+
+  "api/lampac": function (module, exports, require) {
+/*
+ * LampacAdapter — всё, что движок узнаёт от Lampac: адрес и балансер текущего видео,
+ * длительности дорожки «Оригинал» той же серии у нескольких источников.
+ * Сервер Lampac не меняется: используются его открытые lite API и /externalids.
+ *
+ * var lampac = require('./lampac').create({ http, cache });
+ *   cache: { get(key) → { durationMs } | null, set(key, { durationMs }) } — длительности переживают перезапуск.
+ *
+ * ctx (описание текущего видео):
+ *   { url: data.url плеера, card: карточка Lampa, episode: { season, episode } | null, balancer: 'phantom' | '' }
+ */
+'use strict';
+
+var hls = require('../probe/hls');
+
+// Источники, где обычно есть дорожка «Оригинал». У одного источника «оригинал» бывает другой сборкой
+// (ZetflixDB GoT S3E3: на 30 с короче), поэтому сравниваем с несколькими.
+var ORIG_SOURCES = ['phantom', 'aladin', 'zetflixdb'];
+
+var ORIG_RX = /оригинал|оригінал|original|^\s*(english|английск|англ\.?|eng)\b/i;
+var SUBS_RX = /^\s*субтитр/i; // оригинальная дорожка с вшитыми субтитрами — запасной эталон
+var UKR_RX = /укр|ukr/i;
+
+function pickOriginal(list, nameOf) {
+  var alt = null;
+  for (var i = 0; i < list.length; i++) {
+    var n = nameOf(list[i]) || '';
+    if (UKR_RX.test(n)) continue;
+    if (ORIG_RX.test(n)) return list[i];
+    if (!alt && SUBS_RX.test(n)) alt = list[i];
+  }
+  return alt;
+}
+
+// { host, bal, acc } | null. lastBalancer — значение online_last_balanser для карточки.
+function info(url, lastBalancer) {
+  url = String(url || '');
+  var m = url.match(/^(https?:\/\/[^\/]+)\//);
+  var bal = lastBalancer || '';
+  if (!bal) {
+    var b = url.match(/\/lite\/([a-z0-9_]+)/i);
+    bal = b ? b[1] : '';
+  }
+  if (!m || !bal) return null;
+  var acc = [];
+  (url.split('?')[1] || '').split('&').forEach(function (x) {
+    if (/^(account_email|uid|token|nws_id)=/.test(x)) acc.push(x);
+  });
+  return { host: m[1], bal: String(bal).toLowerCase(), acc: acc.join('&') };
+}
+
+// Ссылки, которые Lampac собрал для себя (127.0.0.1), ведём на тот же адрес, что и видео.
+function fixHost(u, host) {
+  return String(u || '').replace(/^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:\d+)?/i, host);
+}
+
+function withAcc(u, acc) {
+  return acc ? u + (u.indexOf('?') >= 0 ? '&' : '?') + acc : u;
+}
+
+function liteUrl(inf, bal, card, episode) {
+  var q = ['rjson=true', 'id=' + encodeURIComponent(card.id)];
+  if (card.imdb_id) q.push('imdb_id=' + card.imdb_id);
+  if (card.kinopoisk_id) q.push('kinopoisk_id=' + card.kinopoisk_id);
+  q.push('title=' + encodeURIComponent(card.title || card.name || ''));
+  q.push('original_title=' + encodeURIComponent(card.original_title || card.original_name || ''));
+  q.push('serial=' + (card.name ? 1 : 0));
+  q.push('original_language=' + (card.original_language || ''));
+  q.push('year=' + String(card.release_date || card.first_air_date || '0000').slice(0, 4));
+  q.push('source=' + (card.source || 'tmdb'));
+  if (episode) q.push('s=' + episode.season);
+  return withAcc(inf.host + '/lite/' + bal + '?' + q.join('&'), inf.acc);
+}
+
+function seasonNumber(x) {
+  return parseInt(x.id || x.s || String(x.name || '').replace(/\D+/g, ''), 10);
+}
+
+function create(deps) {
+  var http = deps.http;
+  var cache = deps.cache || { get: function () { return null; }, set: function () {} };
+
+  // самое низкое качество — плейлист легче, длительность та же
+  function playableUrl(item, done, fail) {
+    var pickQ = function (j) {
+      var q = j.quality || {};
+      var keys = Object.keys(q);
+      keys.sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+      return keys.length ? q[keys[0]] : j.url;
+    };
+    if (item.method === 'call') {
+      http.getJSON(item.url, function (j) {
+        var u = pickQ(j);
+        if (u) done(u);
+        else fail('нет ссылки');
+      }, fail);
+    } else done(pickQ(item));
+  }
+
+  // done(durationMs | null, why)
+  function originalDurationMs(ctx, bal, done) {
+    var inf = info(ctx.url, ctx.balancer);
+    if (!inf) return done(null, 'источник не Lampac');
+    bal = bal || inf.bal;
+    var ep = ctx.episode;
+    var card = ctx.card || {};
+    var key = bal + '|' + card.id + (ep ? '|' + ep.season + 'x' + ep.episode : '');
+    var hit = cache.get(key);
+    if (hit && hit.durationMs) return done(hit.durationMs);
+    var fix = function (u) { return fixHost(u, inf.host); };
+
+    var finish = function (item, why) {
+      if (!item) return done(null, why || 'у источника нет оригинальной дорожки');
+      playableUrl({ method: item.method, url: fix(item.url), quality: item.quality }, function (u) {
+        u = fix(u);
+        if (!/m3u8/i.test(u)) return done(null, 'не HLS');
+        hls.durationMs(http, u, function (r) {
+          cache.set(key, { durationMs: r.durationMs });
+          done(r.durationMs);
+        }, function (e) { done(null, 'плейлист: ' + e); });
+      }, function (e) { done(null, 'ссылка: ' + e); });
+    };
+
+    var episodesOf = function (json, cb) {
+      var voice = json.voice && pickOriginal(json.voice, function (v) { return v.name; });
+      if (!voice) {
+        return cb(null, 'в списке озвучек нет оригинала (' +
+          (json.voice || []).map(function (v) { return v.name; }).join(', ').slice(0, 80) + ')');
+      }
+      if (voice.active) return cb(json);
+      http.getJSON(withAcc(fix(voice.url), inf.acc), cb, function (e) { cb(null, 'не открылась озвучка «' + voice.name + '»: ' + e); });
+    };
+
+    var handle = function (json, depth) {
+      // источник сначала отдаёт список сезонов — переходим в нужный
+      if (json.type === 'season' && ep && depth < 2) {
+        var seasons = json.data || [];
+        for (var si = 0; si < seasons.length; si++) {
+          if (seasonNumber(seasons[si]) === ep.season && seasons[si].url) {
+            return http.getJSON(withAcc(fix(seasons[si].url), inf.acc), function (j) { handle(j, depth + 1); },
+              function (e) { done(null, 'сезон не открылся: ' + e); });
+          }
+        }
+        return done(null, 'у источника нет сезона ' + ep.season);
+      }
+      if (json.type === 'movie') {
+        return finish(pickOriginal(json.data || [], function (x) { return x.translate || x.details || x.title; }),
+          'в списке озвучек нет оригинала (' +
+          (json.data || []).map(function (x) { return x.translate || x.details || ''; }).join(', ').slice(0, 80) + ')');
+      }
+      if (json.type === 'episode' && ep) {
+        return episodesOf(json, function (list, why) {
+          if (!list) return finish(null, why);
+          var items = list.data || [];
+          for (var i = 0; i < items.length; i++) if (parseInt(items[i].e, 10) === ep.episode) return finish(items[i]);
+          finish(null, 'в оригинале нет серии ' + ep.episode);
+        });
+      }
+      if (json.type === 'episode' && !json.voice) return done(null, 'у источника «' + bal + '» одна озвучка, оригинала нет');
+      done(null, 'источник «' + bal + '» ответил «' + json.type + '»' + (ep ? '' : ' (серия не определена)'));
+    };
+
+    var request = function (c) {
+      http.getJSON(liteUrl(inf, bal, c, ep), function (json) { handle(json, 0); },
+        function (e) { done(null, 'источник «' + bal + '» не ответил: ' + e); });
+    };
+
+    if (card.kinopoisk_id || card.imdb_id) return request(card);
+    // id других баз — как это делает онлайн-плагин Lampac
+    http.getJSON(withAcc(inf.host + '/externalids?id=' + encodeURIComponent(card.id) + '&serial=' + (card.name ? 1 : 0), inf.acc),
+      function (ids) {
+        var c = {};
+        var k;
+        for (k in card) c[k] = card[k];
+        for (k in ids) c[k] = ids[k];
+        request(c);
+      }, function () { request(card); });
+  }
+
+  // done([{ source, durationMs, own }], reasons) — текущий источник и ORIG_SOURCES, параллельно.
+  function originals(ctx, done) {
+    var inf = info(ctx.url, ctx.balancer);
+    if (!inf) return done([], 'источник не Lampac');
+    var bals = [inf.bal];
+    for (var i = 0; i < ORIG_SOURCES.length; i++) if (bals.indexOf(ORIG_SOURCES[i]) < 0) bals.push(ORIG_SOURCES[i]);
+    var out = [];
+    var reasons = [];
+    var left = bals.length;
+    bals.forEach(function (b) {
+      originalDurationMs(ctx, b, function (ms, why) {
+        if (ms) out.push({ source: b, durationMs: ms, own: b === inf.bal });
+        else reasons.push(b + ': ' + why);
+        if (--left === 0) {
+          out.sort(function (a, c) { return bals.indexOf(a.source) - bals.indexOf(c.source); });
+          done(out, reasons.join('; '));
+        }
+      });
+    });
+  }
+
+  return {
+    info: function (ctx) { return info(ctx.url, ctx.balancer); },
+    originalDurationMs: originalDurationMs,
+    originals: originals
+  };
+}
+
+module.exports = {
+  ORIG_SOURCES: ORIG_SOURCES,
+  pickOriginal: pickOriginal,
+  info: info,
+  fixHost: fixHost,
+  liteUrl: liteUrl,
+  create: create
+};
+  },
+
+  "engine/diagnostics": function (module, exports, require) {
+/*
+ * ReleaseDiagnostics — этап 1 конвейера: чем это видео отличается от оригинала той же серии.
+ * Чистая функция: на входе длительности, на выходе класс релиза и гипотезы (ADR 3, 7).
+ *
+ * diagnose({
+ *   videoMs, exact,                                // длительность текущего видео (ClientProbe)
+ *   originals: [{ source, durationMs, own }],      // дорожка «Оригинал» у источников (LampacAdapter)
+ *   siblings:  [{ voice, durationMs }]             // другие озвучки этого же источника (необязательно)
+ * }) → ReleaseInfo {
+ *   cls: 'same' | 'near' | 'insertion' | 'fps' | 'cut' | 'different' | 'unknown',
+ *   modelClass: 'constant' | 'drift' | 'structural' | null,
+ *   nearest: { source, durationMs } | null, deltaMs, ratio,
+ *   agree,              // сколько источников подтверждают длительность ближайшего оригинала (±500 мс)
+ *   spreadMs,           // разброс длительностей оригиналов между источниками
+ *   hypotheses: Hypothesis[], text
+ * }
+ *
+ * Сравниваем с БЛИЖАЙШИМ по длительности оригиналом: «Оригинал» одного источника бывает другой сборкой
+ * (GoT S3E3: ZetflixDB 3169.04 против 3201.01 у Phantom и Aladin), а студия не определяет вставку
+ * (каталог студий не ведём — одна студия в разных сериалах ведёт себя по-разному).
+ */
+'use strict';
+
+var types = require('./types');
+var time = require('./time');
+
+var LIMITS = {
+  sameMs: 300,          // совпадает с оригиналом (HLS даёт сотые секунды)
+  sameInexactMs: 1000,  // если длительность видео известна только из video.duration
+  nearMs: 3000,         // до 3 с — разница сборок, не вставка
+  agreeMs: 500,         // источники согласны о длительности оригинала
+  insertionMaxMs: 120000,
+  disagreeMs: 1500,     // оригиналы у источников разной длины
+  fpsTolMs: 1000,        // пересчёт 25 ↔ 23.976 точен до кадров: длительность после пересчёта ±1 с
+  insertionSigmaMs: 7000 // отбивки площадок (Netflix и т. п.) до ~7 с — разница длительностей их не видит
+};
+
+var PAL_TO_FILM = time.FPS.PAL / time.FPS.FILM;
+
+function abs(x) {
+  return x < 0 ? -x : x;
+}
+
+function secs(ms) {
+  return (ms / 1000).toFixed(2);
+}
+
+function diagnose(input) {
+  var videoMs = input.videoMs;
+  var originals = input.originals || [];
+  var siblings = input.siblings || [];
+  var out = { cls: 'unknown', modelClass: null, nearest: null, deltaMs: null, ratio: null, agree: 0, spreadMs: 0, hypotheses: [], text: '' };
+
+  if (!videoMs) {
+    out.text = 'длительность видео неизвестна';
+    return out;
+  }
+  if (!originals.length) {
+    out.text = 'оригинал не найден';
+    return out;
+  }
+
+  var nearest = null;
+  var i;
+  for (i = 0; i < originals.length; i++) {
+    if (!nearest || abs(videoMs - originals[i].durationMs) < abs(videoMs - nearest.durationMs)) nearest = originals[i];
+  }
+  var lo = Infinity;
+  var hi = -Infinity;
+  var agreeing = {};
+  for (i = 0; i < originals.length; i++) {
+    var o = originals[i];
+    lo = Math.min(lo, o.durationMs);
+    hi = Math.max(hi, o.durationMs);
+    if (abs(o.durationMs - nearest.durationMs) <= LIMITS.agreeMs) agreeing[o.source] = true;
+  }
+  var agree = Object.keys(agreeing).length;
+  var delta = videoMs - nearest.durationMs;
+  var ratio = videoMs / nearest.durationMs;
+  var sameMs = input.exact === false ? LIMITS.sameInexactMs : LIMITS.sameMs;
+
+  // другие озвучки той же длительности, что и видео, — ещё одно свидетельство «та же сборка»
+  var sameSiblings = 0;
+  for (i = 0; i < siblings.length; i++) if (abs(siblings[i].durationMs - videoMs) <= LIMITS.agreeMs) sameSiblings++;
+
+  out.nearest = { source: nearest.source, durationMs: nearest.durationMs };
+  out.deltaMs = delta;
+  out.ratio = ratio;
+  out.agree = agree;
+  out.spreadMs = hi - lo;
+
+  var evidence = [{ what: 'длительность видео', value: videoMs, source: input.exact === false ? 'video.duration' : 'hls' }];
+  for (i = 0; i < originals.length; i++) {
+    evidence.push({ what: 'оригинал', value: originals[i].durationMs, source: originals[i].source });
+  }
+  if (sameSiblings) evidence.push({ what: 'озвучки той же длительности', value: sameSiblings, source: 'siblings' });
+
+  var conf;
+  var disagree = out.spreadMs > LIMITS.disagreeMs;
+  var fpsLike = abs(videoMs - nearest.durationMs * PAL_TO_FILM) <= LIMITS.fpsTolMs ||
+    abs(videoMs - nearest.durationMs / PAL_TO_FILM) <= LIMITS.fpsTolMs;
+
+  if (fpsLike) {
+    out.cls = 'fps';
+    out.modelClass = 'drift';
+    conf = agree >= 2 ? 0.8 : 0.6;
+    out.hypotheses.push(types.hypothesis({ estimator: 'duration', kind: 'drift', offsetMs: 0, scale: ratio, sigmaMs: 1000, confidence: conf, evidence: evidence }));
+    out.text = 'другая частота кадров: ×' + ratio.toFixed(4);
+  } else if (abs(delta) <= sameMs) {
+    out.cls = 'same';
+    out.modelClass = 'constant';
+    conf = Math.min(0.95, 0.6 + 0.15 * (agree - 1 + sameSiblings));
+    if (input.exact === false) conf -= 0.2;
+    out.hypotheses.push(types.hypothesis({ estimator: 'duration', kind: 'offset', offsetMs: 0, sigmaMs: sameMs, confidence: conf, evidence: evidence }));
+    out.text = 'совпадает с оригиналом (' + nearest.source + '), вставки нет';
+  } else if (abs(delta) <= LIMITS.nearMs) {
+    out.cls = 'near';
+    out.modelClass = 'constant';
+    out.hypotheses.push(types.hypothesis({ estimator: 'duration', kind: 'offset', offsetMs: 0, sigmaMs: abs(delta) + 500, confidence: 0.3, evidence: evidence }));
+    out.text = 'почти совпадает с оригиналом (' + (delta > 0 ? '+' : '') + secs(delta) + ' с) — другая сборка';
+  } else if (delta > 0 && delta <= LIMITS.insertionMaxMs) {
+    out.cls = 'insertion';
+    out.modelClass = 'constant';
+    conf = 0.35 + (agree >= 2 ? 0.15 : 0) - (disagree ? 0.15 : 0);
+    out.hypotheses.push(types.hypothesis({ estimator: 'openingInsertion', kind: 'opening_insertion_candidate', offsetMs: delta,
+      sigmaMs: LIMITS.insertionSigmaMs, confidence: Math.max(0.1, conf), evidence: evidence }));
+    out.text = 'вероятно, вставка в начале +' + secs(delta) + ' с' + (disagree ? '; оригиналы у источников разной длины' : '');
+  } else if (delta < 0) {
+    out.cls = 'cut';
+    out.modelClass = 'structural';
+    out.text = 'видео короче оригинала на ' + secs(-delta) + ' с — вырезано';
+  } else {
+    out.cls = 'different';
+    out.modelClass = 'structural';
+    out.text = 'видео длиннее оригинала на ' + secs(delta) + ' с — другая версия';
+  }
+  return out;
+}
+
+module.exports = { diagnose: diagnose, LIMITS: LIMITS };
+  },
+
   "engine/time": function (module, exports, require) {
 /*
  * Единая шкала времени движка (ADR 6).
@@ -370,6 +766,12 @@ require('./legacy/plugin');
   var LANG_NAMES = { ru: 'Русские', uk: 'Українські', en: 'English' };
 
   var current = null; // токен текущего видео, чтобы не добавить субтитры к другому
+
+  // модули SubtitleEngine (см. README); прототип переносится в них по задачам плана
+  var http = require('../api/http');
+  var lampacApi = require('../api/lampac').create({ http: http, cache: { get: odurGet, set: odurSet } });
+  var clientProbe = require('../probe/client-probe').create({ http: http });
+  var diagnostics = require('../engine/diagnostics');
 
   function log() {
     try {
@@ -1355,177 +1757,29 @@ require('./legacy/plugin');
     });
   }
 
-  // ---------- длительность оригинала у того же источника ----------
-  // Озвучки студий отличаются от оригинала вставленной заставкой (LostFilm, HDRezka, Newstudio…), и вставляют её не всегда.
-  // Источник Lampac отдаёт рядом с озвучками дорожку «Оригинальный» — та же серия без заставки. Разница длительностей
-  // (до сотых секунды по HLS-плейлисту) и есть длина заставки. Если разница = 25/23.976 — это пересчёт частоты кадров.
+  // ---------- длительность оригинала у источников Lampac ----------
+  // Работа с Lampac — api/lampac.js, плейлисты — probe/hls.js, вывод — engine/diagnostics.js.
 
-  function getText(url, done, fail) {
-    var r = new XMLHttpRequest();
-    r.open('GET', url, true);
-    r.timeout = 20000;
-    r.onload = function () { r.status >= 200 && r.status < 300 ? done(r.responseText) : fail(r.status); };
-    r.onerror = r.ontimeout = function () { fail(0); };
-    r.send(null);
+  function odurGet(key) {
+    var c = store('opensubs_odur')[key];
+    if (!c) return null;
+    return { durationMs: c.ms || (c.d ? Math.round(c.d * 1000) : 0) };
   }
 
-  function getJSON(url, done, fail) {
-    getText(url, function (t) {
-      var j = null;
-      try { j = JSON.parse(t); } catch (e) {}
-      j ? done(j) : fail('json');
-    }, fail);
+  function odurSet(key, v) {
+    var all = store('opensubs_odur');
+    all[key] = { ms: v.durationMs, t: Date.now() };
+    storeSave('opensubs_odur', all, 300);
   }
 
-  function lampacInfo(s) {
-    var m = String(s.data.url || '').match(/^(https?:\/\/[^\/]+)\//);
+  function lampacCtx(s) {
     var bal = '';
     try { bal = store('online_last_balanser')[s.card.id] || ''; } catch (e) {}
-    if (!bal) {
-      var b = String(s.data.url || '').match(/\/lite\/([a-z0-9_]+)/i);
-      bal = b ? b[1] : '';
-    }
-    if (!m || !bal) return null;
-    var acc = [];
-    var qs = String(s.data.url).split('?')[1] || '';
-    qs.split('&').forEach(function (x) { if (/^(account_email|uid|token|nws_id)=/.test(x)) acc.push(x); });
-    return { host: m[1], bal: String(bal).toLowerCase(), acc: acc.join('&') };
-  }
-
-  var ORIG_RX = /оригинал|оригінал|original|^\s*(english|английск|англ\.?|eng)\b/i;
-  var SUBS_RX = /^\s*субтитр/i; // оригинальная дорожка с вшитыми субтитрами — запасной эталон
-
-  function pickOriginal(list, nameOf) {
-    var alt = null;
-    for (var i = 0; i < list.length; i++) {
-      var n = nameOf(list[i]) || '';
-      if (/укр|ukr/i.test(n)) continue;
-      if (ORIG_RX.test(n)) return list[i];
-      if (!alt && SUBS_RX.test(n)) alt = list[i];
-    }
-    return alt;
-  }
-
-  // длительность HLS по плейлисту (сумма EXTINF)
-  function hlsDuration(url, done, fail) {
-    getText(url, function (m) {
-      if (/#EXTINF/.test(m)) {
-        if (!/#EXT-X-ENDLIST/.test(m)) return fail('live');
-        var sum = 0;
-        m.replace(/#EXTINF:([0-9.]+)/g, function (a, d) { sum += parseFloat(d); return a; });
-        return done(sum);
-      }
-      var v = m.match(/^\s*([^#\s][^\s]*)\s*$/m);
-      if (!v) return fail('нет вариантов');
-      var u = v[1];
-      if (/^\//.test(u)) u = url.match(/^https?:\/\/[^\/]+/)[0] + u;
-      else if (!/^https?:/.test(u)) u = url.replace(/[^\/?]*(\?.*)?$/, '') + u;
-      hlsDuration(u, done, fail);
-    }, fail);
-  }
-
-  function playableUrl(item, done, fail) {
-    var pickQ = function (j) {
-      var q = j.quality || {};
-      var keys = Object.keys(q);
-      // самое низкое качество — плейлист легче, длительность та же
-      keys.sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
-      return keys.length ? q[keys[0]] : j.url;
-    };
-    if (item.method === 'call') getJSON(item.url, function (j) { pickQ(j) ? done(pickQ(j)) : fail('нет ссылки'); }, fail);
-    else done(pickQ(item));
-  }
-
-  function originalDuration(s, done, balOverride) {
-    var info = lampacInfo(s);
-    if (!info) return done(null, 'источник не Lampac');
-    if (balOverride) info.bal = balOverride;
-    var ep = episodeInfo(s.data);
-    var key = info.bal + '|' + s.card.id + (ep ? '|' + ep.season + 'x' + ep.episode : '');
-    var cache = store('opensubs_odur');
-    if (cache[key]) return done(cache[key].d);
-
-    // ссылки, которые Lampac собрал для себя (127.0.0.1), ведём на тот же адрес, что и видео
-    var fixHost = function (u) {
-      return String(u || '').replace(/^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:\d+)?/i, info.host);
-    };
-    var finish = function (item, why) {
-      if (!item) return done(null, why || 'у источника нет оригинальной дорожки');
-      item = { method: item.method, url: fixHost(item.url), quality: item.quality };
-      playableUrl(item, function (u) {
-        u = fixHost(u);
-        if (!/m3u8/i.test(u)) return done(null, 'не HLS');
-        hlsDuration(u, function (d) {
-          cache[key] = { d: d, t: Date.now() };
-          storeSave('opensubs_odur', cache, 300);
-          done(d);
-        }, function (e) { done(null, 'плейлист: ' + e); });
-      }, function (e) { done(null, 'ссылка: ' + e); });
-    };
-
-    var episodesOf = function (json, cb) {
-      // json.type === 'episode': серии выбранной озвучки и список озвучек
-      var voice = json.voice && pickOriginal(json.voice, function (v) { return v.name; });
-      if (!voice) return cb(null, 'в списке озвучек нет оригинала (' + (json.voice || []).map(function (v) { return v.name; }).join(', ').slice(0, 80) + ')');
-      if (voice.active) return cb(json);
-      getJSON(withAcc(fixHost(voice.url)), cb, function (e) { cb(null, 'не открылась озвучка «' + voice.name + '»: ' + e); });
-    };
-
-    var withAcc = function (u) { return info.acc ? u + (u.indexOf('?') >= 0 ? '&' : '?') + info.acc : u; };
-
-    var request = function (card) {
-      var q = ['rjson=true', 'id=' + encodeURIComponent(card.id)];
-      if (card.imdb_id) q.push('imdb_id=' + card.imdb_id);
-      if (card.kinopoisk_id) q.push('kinopoisk_id=' + card.kinopoisk_id);
-      q.push('title=' + encodeURIComponent(card.title || card.name || ''));
-      q.push('original_title=' + encodeURIComponent(card.original_title || card.original_name || ''));
-      q.push('serial=' + (card.name ? 1 : 0));
-      q.push('original_language=' + (card.original_language || ''));
-      q.push('year=' + String(card.release_date || card.first_air_date || '0000').slice(0, 4));
-      q.push('source=' + (card.source || 'tmdb'));
-      if (ep) q.push('s=' + ep.season);
-      var handle = function (json, depth) {
-        // источник сначала отдаёт список сезонов — переходим в нужный
-        if (json.type === 'season' && ep && depth < 2) {
-          var seasons = json.data || [];
-          for (var si = 0; si < seasons.length; si++) {
-            var sn = parseInt(seasons[si].id || seasons[si].s || String(seasons[si].name || '').replace(/\D+/g, ''), 10);
-            if (sn === ep.season && seasons[si].url) {
-              return getJSON(withAcc(fixHost(seasons[si].url)), function (j) { handle(j, depth + 1); }, function (e) { done(null, 'сезон не открылся: ' + e); });
-            }
-          }
-          return done(null, 'у источника нет сезона ' + ep.season);
-        }
-        if (json.type === 'movie') return finish(pickOriginal(json.data || [], function (x) { return x.translate || x.details || x.title; }),
-          'в списке озвучек нет оригинала (' + (json.data || []).map(function (x) { return x.translate || x.details || ''; }).join(', ').slice(0, 80) + ')');
-        if (json.type === 'episode' && ep) {
-          return episodesOf(json, function (list, why) {
-            if (!list) return finish(null, why);
-            var items = list.data || [];
-            for (var i = 0; i < items.length; i++) if (parseInt(items[i].e, 10) === ep.episode) return finish(items[i]);
-            finish(null, 'в оригинале нет серии ' + ep.episode);
-          });
-        }
-        if (json.type === 'episode' && !json.voice) return done(null, 'у источника «' + info.bal + '» одна озвучка, оригинала нет');
-        done(null, 'источник «' + info.bal + '» ответил «' + json.type + '»' + (ep ? '' : ' (серия не определена)'));
-      };
-      getJSON(withAcc(info.host + '/lite/' + info.bal + '?' + q.join('&')), function (json) { handle(json, 0); },
-        function (e) { done(null, 'источник «' + info.bal + '» не ответил: ' + e); });
-    };
-
-    var card = s.card;
-    if (card.kinopoisk_id || card.imdb_id) return request(card);
-    // id других баз — как это делает онлайн-плагин Lampac
-    getJSON(withAcc(info.host + '/externalids?id=' + encodeURIComponent(card.id) + '&serial=' + (card.name ? 1 : 0)), function (ids) {
-      var c = {};
-      for (var k in card) c[k] = card[k];
-      for (var n in ids) c[n] = ids[n];
-      request(c);
-    }, function () { request(card); });
+    return { url: s.data.url, card: s.card, episode: episodeInfo(s.data), balancer: bal };
   }
 
   function residualKey(s) {
-    var info = lampacInfo(s);
+    var info = lampacApi.info(lampacCtx(s));
     return info ? s.card.id + '|' + info.bal : null;
   }
 
@@ -1552,26 +1806,6 @@ require('./legacy/plugin');
     log('заставка площадки для сериала:', o);
   }
 
-  // Длительности оригинала у текущего источника и у других источников Lampac с дорожкой «Оригинальный».
-  // У одного источника «оригинал» бывает другой версией видео (ZetflixDB: HBO Max на 30 с короче), поэтому
-  // сравниваем с несколькими.
-  var ORIG_SOURCES = ['phantom', 'aladin', 'zetflixdb'];
-
-  function originalDurations(s, done) {
-    var info = lampacInfo(s);
-    if (!info) return done([], 'источник не Lampac');
-    var bals = [info.bal];
-    for (var i = 0; i < ORIG_SOURCES.length; i++) if (bals.indexOf(ORIG_SOURCES[i]) < 0) bals.push(ORIG_SOURCES[i]);
-    var out = [], reasons = [], left = bals.length;
-    bals.forEach(function (b) {
-      originalDuration(s, function (d, why) {
-        if (d) out.push({ bal: b, d: d, own: b === info.bal });
-        else reasons.push(b + ': ' + why);
-        if (--left === 0) done(out, reasons.join('; '));
-      }, b);
-    });
-  }
-
   function waitDuration(done) {
     var tries = 0;
     var tick = function () {
@@ -1583,16 +1817,6 @@ require('./legacy/plugin');
       setTimeout(tick, 1000);
     };
     tick();
-  }
-
-  // частота кадров видео из HLS-плейлиста (FRAME-RATE)
-  function videoFps(s, done) {
-    var u = String(s.data.url || '');
-    if (!/m3u8/i.test(u)) return done(0);
-    getText(u, function (m) {
-      var f = m.match(/FRAME-RATE=([0-9.]+)/);
-      done(f ? parseFloat(f[1]) : 0);
-    }, function () { done(0); });
   }
 
   function isPal(f) { return Math.abs(f - 25) < 0.1; }
@@ -1637,7 +1861,7 @@ require('./legacy/plugin');
     };
 
     var runDuration = function () {
-    originalDurations(s, function (origs, reason) {
+    lampacApi.originals(lampacCtx(s), function (origs, reason) {
       if (session !== s) return;
       if (!origs.length) {
         s.durStatus = 'не удалось: ' + reason;
@@ -1645,46 +1869,27 @@ require('./legacy/plugin');
         applyFpsOnly(s.durStatus);
         return finishD(false);
       }
-      waitDuration(function (cur) {
+      var withVideo = function (videoMs, exact) {
         if (session !== s) return;
-        if (!cur) {
-          s.durStatus = 'не удалось узнать длительность видео';
-          applyFpsOnly(s.durStatus);
-          return finishD(false);
-        }
-        var near = null, own = null;
-        for (var oi = 0; oi < origs.length; oi++) {
-          if (!near || Math.abs(cur - origs[oi].d) < Math.abs(cur - near.d)) near = origs[oi];
-          if (origs[oi].own) own = origs[oi];
-        }
-        log('длительность: видео', cur.toFixed(2), 'оригиналы', origs.map(function (o) { return o.bal + ' ' + o.d.toFixed(2); }).join(', '));
-        // есть оригинал той же длительности — значит, заставки нет; иначе берём оригинал своего источника
-        var orig = Math.abs(cur - near.d) <= 3 ? near.d : own ? own.d : near.d;
-        var spread = 0;
-        for (var oj = 0; oj < origs.length; oj++) spread = Math.max(spread, Math.abs(origs[oj].d - orig));
-        var diff = cur - orig, ratio = cur / orig;
-        if (Math.abs(diff) <= 3 && Math.abs(diff) > 0.3) diff = 0.2; // разница сборок, не заставка
-        if (Math.abs(diff) > 3 && !own && spread > 1.5) {
-          s.durStatus = 'оригиналы у источников разной длины — сдвиг не определить';
-          applyFpsOnly(s.durStatus);
-          return finishD(false);
-        }
+        var rel = diagnostics.diagnose({ videoMs: videoMs, exact: exact, originals: origs });
+        s.release = rel;
+        s.durStatus = rel.text;
+        log('длительность: видео', (videoMs / 1000).toFixed(2) + (exact ? '' : ' (video.duration)'), 'оригиналы',
+          origs.map(function (o) { return o.source + ' ' + (o.durationMs / 1000).toFixed(2); }).join(', '), '→', rel.cls);
+        var nearOwn = false;
+        for (var oi = 0; oi < origs.length; oi++) if (origs[oi].own && rel.nearest && origs[oi].source === rel.nearest.source) nearOwn = true;
         var v = { scale: 1, offset: 0, anchors: [], src: 'duration' };
-        if (Math.abs(ratio - 23.976 / 25) < 0.002 || Math.abs(ratio - 25 / 23.976) < 0.002) {
-          v.scale = ratio;
-          s.durStatus = 'другая частота кадров: ×' + ratio.toFixed(4);
-        } else if (Math.abs(diff) <= 0.3) {
-          diff = 0;
-          s.durStatus = 'совпадает с оригиналом, заставки нет';
-        } else if (diff > 0 && diff <= 120) {
+        var diff = null;
+        if (rel.cls === 'fps') v.scale = rel.ratio;
+        else if (rel.cls === 'same' || rel.cls === 'near') diff = 0;
+        else if (rel.cls === 'insertion' && !(rel.spreadMs > diagnostics.LIMITS.disagreeMs && !nearOwn && rel.agree < 2)) {
+          diff = rel.deltaMs / 1000;
           v.offset = diff;
-          s.durStatus = 'заставка озвучки ' + (diff > 0 ? '+' : '') + diff.toFixed(1) + ' с';
         } else {
-          s.durStatus = 'разница ' + diff.toFixed(0) + ' с — слишком большая, похоже на другую версию';
           applyFpsOnly(s.durStatus);
           return finishD(false);
         }
-        s.durDiff = v.scale === 1 ? diff : null;
+        s.durDiff = diff;
         // видео и оригинал совпадают по скорости, но эталонные субтитры в другой системе кадров
         if (v.scale === 1 && s.palScale && s.palScale !== 1) {
           v.scale = s.palScale;
@@ -1706,13 +1911,27 @@ require('./legacy/plugin');
         resyncAll();
         if (Math.abs(v.offset - (old.offset || 0)) >= 0.5 || v.scale !== (old.scale || 1)) notify('Субтитры подстроены под озвучку: ' + s.durStatus);
         finishD(true);
+      };
+      if (s.probe && s.probe.durationMs && s.probe.exact) return withVideo(s.probe.durationMs, true);
+      waitDuration(function (cur) {
+        if (session !== s) return;
+        if (!cur) {
+          s.durStatus = 'не удалось узнать длительность видео';
+          applyFpsOnly(s.durStatus);
+          return finishD(false);
+        }
+        withVideo(Math.round(cur * 1000), false);
       });
     });
     };
 
-    // частота кадров видео против эталонных субтитров, затем длительность оригинала
-    videoFps(s, function (vf) {
+    // характеристики видео (длительность по плейлисту, заявленный FPS), затем длительность оригинала
+    var playerVideo = null;
+    try { playerVideo = Lampa.PlayerVideo.video(); } catch (e) {}
+    clientProbe.probe({ url: s.data.url, video: playerVideo }, function (info) {
       if (session !== s) return;
+      s.probe = info;
+      var vf = info.fps.declared || 0;
       s.vidFps = vf;
       var ref = s.found && s.found.en && s.found.en[0];
       // эталон — английские; если их нет — сам файл показываемых субтитров
@@ -2575,6 +2794,175 @@ require('./legacy/plugin');
     });
   }
 })();
+  },
+
+  "probe/client-probe": function (module, exports, require) {
+/*
+ * ClientProbe — характеристики видео, доступные в браузере (ADR 1).
+ *   длительность: HLS-плейлист (сумма EXTINF, exact) или video.duration (exact = false);
+ *   FPS заявленный: FRAME-RATE в master-плейлисте (24 и 23.976 путаются — только подсказка);
+ *   FPS измеренный: getVideoPlaybackQuality за несколько секунд воспроизведения —
+ *     отличает 25 от 24, но не 24 от 23.976;
+ *   VFR и начало потоков браузеру недоступны: vfr = null, startMs = 0.
+ *
+ * var probe = require('./client-probe').create({ http });
+ * probe.probe({ url, video }, done(ProbeInfo))
+ */
+'use strict';
+
+var hls = require('./hls');
+var types = require('../engine/types');
+
+// Номинальная частота по измерению: 25 (PAL) или «плёночная» 24/23.976; иначе null.
+function nominalFps(measured) {
+  if (!measured) return null;
+  if (measured > 24.6 && measured < 25.4) return 25;
+  if (measured > 23.5 && measured < 24.5) return 24;
+  if (measured > 29.5 && measured < 30.5) return 30;
+  return null;
+}
+
+function videoDurationMs(video) {
+  var d = video && video.duration;
+  return d && isFinite(d) && d > 60 ? Math.round(d * 1000) : null;
+}
+
+// Кадры за время воспроизведения: done(fps | null). Без getVideoPlaybackQuality — null.
+function measureFps(video, done, windowMs, timer) {
+  timer = timer || setTimeout;
+  windowMs = windowMs || 6000;
+  var sample = function () {
+    try {
+      var q = video.getVideoPlaybackQuality && video.getVideoPlaybackQuality();
+      if (!q || typeof q.totalVideoFrames !== 'number') return null;
+      return { frames: q.totalVideoFrames, t: video.currentTime };
+    } catch (e) {
+      return null;
+    }
+  };
+  var a = sample();
+  if (!a) return done(null);
+  timer(function () {
+    var b = sample();
+    var dt = b ? b.t - a.t : 0;
+    // перемотка или пауза портят замер
+    if (!b || dt < windowMs / 2000 || dt > windowMs / 500) return done(null);
+    done((b.frames - a.frames) / dt);
+  }, windowMs);
+}
+
+function create(deps) {
+  var http = deps.http;
+
+  function probe(req, done) {
+    var url = String(req.url || '');
+    var fallback = function (declared) {
+      done(types.probeInfo({
+        source: 'client',
+        durationMs: videoDurationMs(req.video),
+        exact: false,
+        fps: { declared: declared || null },
+        streams: [{ kind: 'video' }, { kind: 'audio' }]
+      }));
+    };
+    if (!/m3u8/i.test(url)) return fallback(null);
+    hls.durationMs(http, url, function (r) {
+      done(types.probeInfo({
+        source: 'client',
+        durationMs: r.durationMs,
+        exact: true,
+        fps: { declared: r.frameRate },
+        streams: [{ kind: 'video', durationMs: r.durationMs }, { kind: 'audio' }]
+      }));
+    }, function () { fallback(null); });
+  }
+
+  return { name: 'client', probe: probe };
+}
+
+module.exports = { create: create, nominalFps: nominalFps, measureFps: measureFps, videoDurationMs: videoDurationMs };
+  },
+
+  "probe/hls": function (module, exports, require) {
+/*
+ * Разбор HLS-плейлистов: длительность по сумме EXTINF (до сотых секунды) и заявленная частота кадров.
+ * Чистые функции + durationMs(http, url), который проходит master → media.
+ */
+'use strict';
+
+function resolveUrl(base, ref) {
+  ref = String(ref);
+  if (/^https?:\/\//i.test(ref)) return ref;
+  var origin = String(base).match(/^https?:\/\/[^\/]+/i);
+  if (ref.charAt(0) === '/') return (origin ? origin[0] : '') + ref;
+  return String(base).replace(/[^\/?]*(\?.*)?$/, '') + ref;
+}
+
+// → { type: 'media', durationMs, ended, segments }
+//   { type: 'master', variants: [{ url, bandwidth, frameRate }] }
+//   { type: 'unknown' }
+function parse(text, baseUrl) {
+  text = String(text || '').replace(/\r/g, '');
+  if (/#EXTINF/.test(text)) {
+    var ms = 0;
+    var segments = 0;
+    text.replace(/#EXTINF:\s*([0-9.]+)/g, function (all, d) {
+      // сумма в мс по каждому сегменту, иначе ошибка округления float копится на тысячах сегментов
+      ms += Math.round(parseFloat(d) * 1000);
+      segments++;
+      return all;
+    });
+    return { type: 'media', durationMs: ms, ended: /#EXT-X-ENDLIST/.test(text), segments: segments };
+  }
+  var lines = text.split('\n');
+  var variants = [];
+  var attrs = null;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].replace(/^\s+|\s+$/g, '');
+    if (!line) continue;
+    if (/^#EXT-X-STREAM-INF:/.test(line)) {
+      attrs = line;
+      continue;
+    }
+    if (line.charAt(0) === '#') continue;
+    var bw = attrs && attrs.match(/[:,]BANDWIDTH=(\d+)/);
+    var fr = attrs && attrs.match(/FRAME-RATE=([0-9.]+)/);
+    variants.push({
+      url: resolveUrl(baseUrl || '', line),
+      bandwidth: bw ? parseInt(bw[1], 10) : null,
+      frameRate: fr ? parseFloat(fr[1]) : null
+    });
+    attrs = null;
+  }
+  return variants.length ? { type: 'master', variants: variants } : { type: 'unknown' };
+}
+
+// Заявленная частота кадров (первая найденная). Ненадёжна: 24.000 и 23.976 путают (ADR, факты).
+function frameRate(parsed) {
+  if (!parsed || parsed.type !== 'master') return null;
+  for (var i = 0; i < parsed.variants.length; i++) if (parsed.variants[i].frameRate) return parsed.variants[i].frameRate;
+  return null;
+}
+
+// done({ durationMs, frameRate }) | fail(reason). Глубина — защита от зацикленных плейлистов.
+function durationMs(http, url, done, fail, depth) {
+  depth = depth || 0;
+  if (depth > 3) return fail('слишком глубокий плейлист');
+  http.getText(url, function (text) {
+    var p = parse(text, url);
+    if (p.type === 'media') {
+      if (!p.ended) return fail('live');
+      return done({ durationMs: p.durationMs, frameRate: null });
+    }
+    if (p.type !== 'master') return fail('нет вариантов');
+    var fr = frameRate(p);
+    durationMs(http, p.variants[0].url, function (r) {
+      done({ durationMs: r.durationMs, frameRate: fr || r.frameRate });
+    }, fail, depth + 1);
+  }, fail);
+}
+
+module.exports = { parse: parse, resolveUrl: resolveUrl, frameRate: frameRate, durationMs: durationMs };
   },
 
   "probe/unknown": function (module, exports, require) {
