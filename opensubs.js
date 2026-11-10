@@ -143,12 +143,17 @@ module.exports = function (app) {
     // после расчёта по длительности остаётся только заставка площадки и разница релизов — ищем рядом
     // широкий поиск (±90 с) — только пока субтитры скрыты и ждут проверки; при показе звук лишь доводит время
     var dmax = s0 && s0.waiting && !vs.anchors.length && vs.src !== 'duration' ? 90 : 15;
-    var res = audioEstimator.evaluate({
+    var res = audioEstimator.evaluateGuarded({
       samples: a.samples,
       cues: cues.map(function (q) { return { start: q.start * c.scale + c.offset, end: q.end * c.scale + c.offset }; }),
       dmaxSec: dmax
     });
     if (!res) return;
+    if (res.contradicted) {
+      // широкий поиск нашёл уверенный сдвиг вне узкого окна — для калибровки и отчёта
+      a.wide = { offsetMs: Math.round((vs.offset + res.contradicted.shift) * 1000), z: res.contradicted.z1 };
+      app.log('звук: узкий пик ' + res.shift.toFixed(1) + ' с отвергнут, широкий поиск даёт ' + res.contradicted.shift.toFixed(1) + ' с');
+    }
     var shift = res.shift, z1 = res.z1, z2 = res.z2;
     app.log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1), res.strong ? 'сильное' : '');
     a.evals = (a.evals || 0) + 1;
@@ -1159,8 +1164,8 @@ module.exports = function (app) {
   "calibration/checkpoints": function (module, exports, require) {
 /*
  * Калибровка пользователем (документ, «Калибровка пользователем»; задача 5).
- *   choices(cues, toPlayer, atMs, page) — 3 реплики, ближайшие к текущему моменту по текущей модели;
- *                                       page 1, 2… — следующие тройки («ни одна не подходит»).
+ *   choices(cues, maps, atMs, page)    — 4 реплики: звучащая сейчас при каждой гипотезе сдвига, затем
+ *                                       недавно прозвучавшие; page 1, 2… — дальше («ни одна не подходит»).
  *   point(cue, toRef, atMs)            — якорь { o, t } в секундах прототипа: момент эталона o звучит в t.
  *   nextPrompt(beforeMs, afterMs, cls, atMs) — когда попросить вторую точку (или null).
  *   alreadyInSync(currentOffsetMs, atMs) — «Субтитры уже совпадают»: текущая модель становится ручной точкой.
@@ -1168,26 +1173,56 @@ module.exports = function (app) {
  */
 'use strict';
 
-var PER_PAGE = 3;
+var PER_PAGE = 4;
 var WINDOW_MS = 600000;   // дальше ±10 минут от текущего момента не предлагаем
 var REACTION_MS = 300;    // пользователь узнаёт фразу чуть позже её начала
 var SECOND_AFTER_MS = 600000;
 var SECOND_IF_MS = 1500;
 
+// Реплика, которая звучит в момент atMs при данном переводе времени (последняя начавшаяся).
+function playingAt(cues, toPlayer, atMs) {
+  var best = -1;
+  for (var i = 0; i < cues.length; i++) if (toPlayer(cues[i].startMs) <= atMs) best = i;
+  return best;
+}
+
+// toPlayer — текущая модель или список переводов: [текущая модель, альтернативы…] (сдвиг 0, отброшенные
+// гипотезы, профиль). Первая страница — реплика, звучащая сейчас при каждом варианте, затем ближайшие
+// уже прозвучавшие; пользователь узнаёт то, что услышал, а не то, что будет (приёмка 10.11).
 function choices(cues, toPlayer, atMs, page) {
   page = page || 0;
-  var pool = [];
+  var maps = typeof toPlayer === 'function' ? [toPlayer] : toPlayer;
+  var main = maps[0];
+  var order = [];
+  var seen = {};
+  var add = function (i) {
+    if (i < 0 || i >= cues.length || seen[i]) return;
+    seen[i] = true;
+    order.push(i);
+  };
+  maps.forEach(function (fn) { add(playingAt(cues, fn, atMs)); });
+  // затем по текущей модели: прозвучавшие недавно (назад до 10 минут), потом ближайшие следующие
+  var past = [], future = [];
   for (var i = 0; i < cues.length; i++) {
-    var p = toPlayer(cues[i].startMs);
+    var p = main(cues[i].startMs);
     if (Math.abs(p - atMs) > WINDOW_MS) continue;
-    // звучащая сейчас или только что прозвучавшая реплика — первая; будущие чуть менее вероятны
-    var d = p <= atMs ? atMs - p : (p - atMs) * 1.5;
-    pool.push({ index: i, text: cues[i].text, playerMs: p, rank: d });
+    if (p <= atMs) past.push({ i: i, d: atMs - p });
+    else future.push({ i: i, d: p - atMs });
   }
-  pool.sort(function (a, b) { return a.rank - b.rank; });
-  var items = pool.slice(page * PER_PAGE, page * PER_PAGE + PER_PAGE);
-  items.sort(function (a, b) { return a.playerMs - b.playerMs; });
-  return { items: items, more: pool.length > (page + 1) * PER_PAGE };
+  past.sort(function (x, y) { return x.d - y.d; });
+  future.sort(function (x, y) { return x.d - y.d; });
+  var k = 0;
+  while (k < past.length || k < future.length) {
+    if (k < past.length) add(past[k].i);
+    if (k < past.length && k + 1 < past.length) add(past[k + 1].i);
+    if (k < future.length) add(future[k].i);
+    k += 2;
+  }
+  var items = order.slice(page * PER_PAGE, page * PER_PAGE + PER_PAGE).map(function (idx) {
+    return { index: idx, text: cues[idx].text, playerMs: main(cues[idx].startMs) };
+  });
+  items.sort(function (x, y) { return x.playerMs - y.playerMs; }); // на экране — по порядку фильма
+  return { items: items, more: order.length > (page + 1) * PER_PAGE };
 }
 
 function point(cue, toRef, atMs) {
@@ -1293,7 +1328,7 @@ var LIMITS = {
   agreeMs: 500,         // источники согласны о длительности оригинала
   insertionMaxMs: 120000,
   disagreeMs: 1500,     // оригиналы у источников разной длины
-  fpsTolMs: 1000,        // пересчёт 25 ↔ 23.976 точен до кадров: длительность после пересчёта ±1 с
+  fpsTolMs: 2500,        // пересчёт 25 ↔ 23.976: длительность после пересчёта ±2.5 с (ГоТ 3×3 Кравец: 1.27 с)
   insertionSigmaMs: 7000 // отбивки площадок (Netflix и т. п.) до ~7 с — разница длительностей их не видит
 };
 
@@ -1359,8 +1394,16 @@ function diagnose(input) {
 
   var conf;
   var disagree = out.spreadMs > LIMITS.disagreeMs;
-  var fpsLike = abs(videoMs - nearest.durationMs * PAL_TO_FILM) <= LIMITS.fpsTolMs ||
-    abs(videoMs - nearest.durationMs / PAL_TO_FILM) <= LIMITS.fpsTolMs;
+  // PAL-версия далека от всех оригиналов по длительности, поэтому сверяем пересчёт с каждым
+  var fpsLike = false;
+  for (i = 0; i < originals.length && !fpsLike && abs(delta) > LIMITS.nearMs; i++) {
+    var od = originals[i].durationMs;
+    if (abs(videoMs - od * PAL_TO_FILM) <= LIMITS.fpsTolMs || abs(videoMs - od / PAL_TO_FILM) <= LIMITS.fpsTolMs) {
+      fpsLike = true;
+      ratio = videoMs / od;
+      out.nearest = { source: originals[i].source, durationMs: od };
+    }
+  }
 
   if (fpsLike) {
     out.cls = 'fps';
@@ -1514,18 +1557,31 @@ function similarity(a, b) {
   return uni ? inter / uni : 0;
 }
 
-// target — атрибуты показываемых субтитров (или null)
+// Эталон должен совпадать по хронометражу с ВИДЕО (оригиналом источника), а не с показываемыми субтитрами:
+// субтитры к нему приводятся. Видео онлайн-источников — обычно релиз площадки сериала (NF, HMAX…), поэтому
+// opts.platform (из networks карточки) даёт главный бонус. Приёмка 10.11: эталон «того же релиза, что и
+// русские» давал ST 1×3 без отбивки Netflix (спешат) и GoT 3×3 с «ранее в сериале» (−89 с).
 function reference(enList, target, opts) {
   if (!enList || !enList.length) return null;
-  if (!target) return pick(enList, opts);
-  var plat = platformOf(target);
+  opts = opts || {};
   var best = null, bestScore = -Infinity;
   for (var i = 0; i < enList.length; i++) {
     var e = enList[i];
-    var s = similarity(e, target) * 20 + (plat && platformOf(e) === plat ? 6 : 0) + score(e, opts) / 4;
+    var s = score(e, opts) + (opts.platform && platformOf(e) === opts.platform ? 10 : 0);
     if (s > bestScore) { best = e; bestScore = s; }
   }
   return best;
+}
+
+// Площадка сериала по networks карточки TMDB: Netflix → nf, HBO → hmax и т. д.
+var NETWORKS = [[/netflix/i, 'nf'], [/hbo|max/i, 'hmax'], [/amazon|prime video/i, 'amzn'], [/apple tv/i, 'atvp'],
+  [/disney/i, 'dsnp'], [/hulu/i, 'hulu'], [/peacock/i, 'pcok'], [/paramount/i, 'pmtp']];
+function platformOfCard(card) {
+  var nets = (card && (card.networks || card.production_companies)) || [];
+  for (var i = 0; i < nets.length; i++) {
+    for (var j = 0; j < NETWORKS.length; j++) if (NETWORKS[j][0].test(nets[i].name || '')) return NETWORKS[j][1];
+  }
+  return null;
 }
 
 // Фильм без оригинала: последняя реплика заканчивается до конца видео, но не раньше чем за 15% (титры).
@@ -1547,7 +1603,7 @@ function timeline(cues, videoMs) {
 
 module.exports = {
   BAD_RELEASE: BAD_RELEASE, GOOD_RELEASE: GOOD_RELEASE, PLATFORM_RELEASE: PLATFORM_RELEASE,
-  score: score, pick: pick, reference: reference, similarity: similarity, platformOf: platformOf, timeline: timeline
+  score: score, pick: pick, reference: reference, platformOfCard: platformOfCard, similarity: similarity, platformOf: platformOf, timeline: timeline
 };
   },
 
@@ -1807,7 +1863,8 @@ function solve(hyps, opts) {
   }
 
   var conf = combined(used, true);
-  var loose = combined(used, false);
+  // профиль соседней серии или другого релиза в одиночку не показывает субтитры (ADR 4)
+  var loose = combined(used.filter(function (h) { return h.estimator !== 'profile'; }), false);
   var hasManual = used.some(function (h) { return h.estimator === 'checkpoint'; });
   var status;
   if (hasManual) status = 'verified';
@@ -2142,11 +2199,17 @@ module.exports = function (app) {
   // --- файл (профиль субтитров: файл → эталон)
   app.fileSync = function fileSync(fid) {
     var p = app.profiles.subs.get(fid);
-    return { scale: p.scale, offset: p.offsetMs / 1000, known: p.known };
+    return { scale: p.scale, offset: p.offsetMs / 1000, known: p.known, ref: p.refRelease };
   };
 
+  // ref — file_id эталона, к которому приведён файл: сменился эталон — пересчитываем
   app.setFileSync = function setFileSync(fid, f) {
-    app.profiles.subs.set(fid, { scale: f.scale, offsetMs: f.offset * 1000 });
+    app.profiles.subs.set(fid, { scale: f.scale, offsetMs: f.offset * 1000, refRelease: f.ref ? String(f.ref) : undefined });
+  };
+
+  // эталон для сверки: английские под хронометраж видео — площадка сериала (networks карточки), затем ранг
+  app.referenceFor = function referenceFor(s) {
+    return s && s.found && reference.reference(s.found.en, null, { fps: s.vidFps, platform: reference.platformOfCard(s.card) });
   };
 
 
@@ -2350,7 +2413,7 @@ module.exports = function (app) {
   app.autoSync = function autoSync(track, done) {
     var s = app.session;
     var fid = track.os_id;
-    var ref = s && reference.reference(s.found.en, track.os_attrs, { fps: s.vidFps });
+    var ref = app.referenceFor(s);
     if (!fid || !app.texts[fid]) return done(null, 'нет файла');
     if (!ref) return done(null, 'нет английских субтитров для сравнения');
     var rid = ref.files[0].file_id;
@@ -2363,7 +2426,8 @@ module.exports = function (app) {
         var est = crossSubs.estimate(app.cueStartsMs(text, app.fileSync(rid)), app.cueStartsMs(app.texts[fid]));
         if (!est.ok) return done(null, est.reason);
         var res = { scale: est.result.scale, offset: est.result.offsetMs / 1000, score: est.result.score, ratio: est.result.ratio };
-        app.setFileSync(fid, { scale: res.scale, offset: res.offset });
+        app.setFileSync(fid, { scale: res.scale, offset: res.offset, ref: rid });
+        s.refUsed = { fid: rid, release: ref.release || '' };
         app.resyncAll();
         done(res);
       }, 30);
@@ -2391,14 +2455,17 @@ module.exports = function (app) {
   // при первом включении неанглийских субтитров — выровнять файл по английским (один раз на файл)
   app.maybeAutoSync = function maybeAutoSync(track) {
     if (!app.flag('autosync', true) || !track || !track.os_id || track.language === 'en') return;
-    if (app.fileSync(track.os_id).known) return;
+    var known = app.fileSync(track.os_id);
+    var ref = app.referenceFor(app.session);
+    // уже выровнен по этому же эталону — не пересчитываем; эталон сменился или запись старая — пересчёт
+    if (known.known && (!ref || known.ref === String(ref.files[0].file_id) || (!known.ref && known.scale === 1 && !known.offset))) return;
     app.autoSync(track, function (res, reason) {
       if (res) {
         app.log('по английским:', app.describeAuto(res), 'совпадение', res.ratio.toFixed(2));
         if (Math.abs(res.offset) > 0.3 || res.scale !== 1) app.notify('Субтитры выровнены: ' + app.describeAuto(res));
       } else {
         app.log('по английским не удалось:', reason);
-        app.setFileSync(track.os_id, { scale: 1, offset: 0 }); // не пробовать снова
+        app.setFileSync(track.os_id, { scale: 1, offset: 0, ref: ref ? ref.files[0].file_id : null }); // не пробовать снова
       }
     });
   };
@@ -2577,7 +2644,7 @@ module.exports = function (app) {
       // эталон — английские того же релиза (ReferenceSelector); если их нет — сам файл показываемых субтитров
       var bgT = s.bg && app.findTrack(s.bg);
       var shownT = bgT || app.isShowing();
-      var ref = s.found && reference.reference(s.found.en, shownT && shownT.os_attrs, { fps: vf });
+      var ref = app.referenceFor(s);
       var refFps = (ref && parseFloat(ref.fps)) || (bgT && bgT.os_fps) || 0;
       s.refFps = refFps;
       var fe = fpsEstimator.estimate({ subsFps: refFps, videoFpsDeclared: vf, videoFpsMeasured: s.fpsMeasured });
@@ -2597,6 +2664,13 @@ module.exports = function (app) {
     var key = app.videoKey(s);
     var out = [];
     out.push({ title: 'Источник и озвучка', subtitle: (key.balancer || '—') + ' · ' + (key.voice || '—') + (key.season ? ' · S' + key.season + 'E' + key.episode : ' · фильм') });
+    var shownTr = app.isShowing() || (s.bg && app.findTrack(s.bg));
+    if (shownTr && shownTr.os_id) {
+      var fsr = app.fileSync(shownTr.os_id);
+      out.push({ title: 'Субтитры', subtitle: shownTr.os_id + ' · ' + ((shownTr.os_attrs && shownTr.os_attrs.release) || shownTr.label || '') });
+      out.push({ title: 'Эталон для сверки', subtitle: s.refUsed ? s.refUsed.fid + ' · ' + s.refUsed.release : (fsr.ref ? 'file ' + fsr.ref : 'не использовался') +
+        ' · файл → эталон ' + (fsr.offset >= 0 ? '+' : '') + fsr.offset.toFixed(2) + ' с ×' + fsr.scale.toFixed(4) });
+    }
     out.push({ title: 'Длительность видео', subtitle: s.probe && s.probe.durationMs ? sec(s.probe.durationMs) + (s.probe.exact ? ' (плейлист)' : ' (плеер)') + ' · ' + s.probe.source : 'неизвестна' });
     out.push({ title: 'Частота кадров', subtitle: 'метка ' + (s.vidFps || '—') + ', замер ' + (s.fpsMeasured ? s.fpsMeasured.toFixed(2) : '—') + ', субтитры ' + (s.refFps || '—') });
     out.push({ title: 'Оригиналы', subtitle: (s.originals || []).map(function (o) { return o.source + ' ' + sec(o.durationMs); }).join(', ') || (s.originalsWhy || 'не найдены') });
@@ -2618,7 +2692,8 @@ module.exports = function (app) {
     var v = app.videoSync();
     out.push({ title: 'Применено к видео', subtitle: (v.offset >= 0 ? '+' : '') + v.offset.toFixed(2) + ' с, ×' + v.scale.toFixed(4) + (v.manual ? ', вручную' : '') +
       (s.vsyncLevel ? ', профиль: ' + s.vsyncLevel : ', профиль новый') + (v.anchors && v.anchors.length ? ', точек ' + v.anchors.length : '') });
-    out.push({ title: 'Звук', subtitle: app.audioDenied ? 'не работает: ' + app.audioDenied : app.audio ? app.audio.status : 'не запускался' });
+    out.push({ title: 'Звук', subtitle: app.audioDenied ? 'не работает: ' + app.audioDenied : app.audio ? app.audio.status +
+      (app.audio.wide ? '; широкий поиск: ' + (app.audio.wide.offsetMs / 1000).toFixed(1) + ' с (z ' + app.audio.wide.z.toFixed(1) + ')' : '') : 'не запускался' });
     return out;
   };
 
@@ -3132,6 +3207,25 @@ function evaluate(o) {
   };
 }
 
+// Узкий поиск (±15 с вокруг показанной модели) не видит сдвиг за пределами окна и может принять случайный пик
+// (приёмка 10.11: GoT 3×3 Кравец, звук «+7.6 с» при настоящем −89 с). Поэтому тот же звук проверяется и
+// широким поиском ±120 с: если там уверенный пик в другом месте, узкий результат не принимается,
+// а широкий отдаётся как отдельная гипотеза (contradicted).
+function evaluateGuarded(o) {
+  var narrow = evaluate(o);
+  if (!narrow || (o.dmaxSec || 15) > 20) return narrow;
+  var wideOpts = {};
+  for (var k in o) wideOpts[k] = o[k];
+  wideOpts.dmaxSec = 120;
+  var wide = evaluate(wideOpts);
+  if (wide && wide.confident && Math.abs(wide.shift - narrow.shift) > 2) {
+    narrow.confident = false;
+    narrow.strong = false;
+    narrow.contradicted = wide;
+  }
+  return narrow;
+}
+
 // Сдвиг модели после проверки: прежний сдвиг + найденная поправка, в центре окна.
 function hypothesis(res, baseOffsetMs) {
   var at = Math.round((res.tStart + res.tEnd) / 2 * 1000);
@@ -3150,7 +3244,7 @@ function hypothesis(res, baseOffsetMs) {
   });
 }
 
-module.exports = { STEP: STEP, WIN: WIN, MIN: MIN, STRONG: STRONG, frameFeatures: frameFeatures, evaluate: evaluate, hypothesis: hypothesis, needZ: needZ };
+module.exports = { evaluateGuarded: evaluateGuarded, STEP: STEP, WIN: WIN, MIN: MIN, STRONG: STRONG, frameFeatures: frameFeatures, evaluate: evaluate, hypothesis: hypothesis, needZ: needZ };
   },
 
   "estimators/cross-subs": function (module, exports, require) {
@@ -3956,12 +4050,14 @@ function create(io, now) {
       if (!r) return null;
       var level = 'medium';
       if (r.durationMs && durationMs) level = Math.abs(r.durationMs - durationMs) <= SAME_DURATION_MS ? 'high' : 'low';
+      // записи прототипа (без версии) часто хранили ошибочные сдвиги — только гипотеза (приёмка 10.11)
+      if (!r.v) level = 'low';
       return { record: r, level: level };
     },
     set: function (key, v) {
       var rec = {
         scale: v.scale, offsetMs: round(v.offsetMs), pieces: v.pieces || undefined, anchors: (v.anchors || []).slice(-8),
-        manual: !!v.manual, src: v.src || undefined, durationMs: v.durationMs || undefined,
+        manual: !!v.manual, src: v.src || undefined, durationMs: v.durationMs || undefined, v: 2,
         dd: v.dd === null || v.dd === undefined ? undefined : v.dd, t: now()
       };
       all(NAMES.video)[videoKey(key)] = rec;
@@ -4140,6 +4236,24 @@ module.exports = function (app) {
     return btn;
   };
 
+  // Кнопка «Сверить по фразе» рядом с CC: калибровка в одно нажатие, без пути через настройки (приёмка 10.11).
+  // Видна, пока показаны субтитры OpenSubtitles. Иконка — Lucide «timer», в размер и толщину CC.
+  app.SYNC_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<line x1="10" x2="14" y1="2" y2="2"/><line x1="12" x2="15" y1="14" y2="11"/><circle cx="12" cy="14" r="8"/></svg>';
+
+  app.makeSyncButton = function makeSyncButton() {
+    var btn = document.createElement('div');
+    btn.className = 'player-panel__opensubs ops-sync button selector hide';
+    btn.innerHTML = app.SYNC_ICON + '<div class="tooltip">Сверить субтитры по фразе</div>';
+    $(btn).on('hover:enter', function () {
+      var t = app.isShowing() || app.calibTrack();
+      if (!t || !t.os_id) return Lampa.Noty.show('Сначала включите субтитры OpenSubtitles');
+      var close = function () { app.closeSelects(); };
+      app.calibrationMenu(t, close, close);
+    });
+    return btn;
+  };
+
   app.updateButtons = function updateButtons() {
     var on = !!app.isShowing();
     var waiting = !!(app.session && app.session.waiting);
@@ -4155,6 +4269,9 @@ module.exports = function (app) {
       var tip = btns[i].querySelector('.tooltip');
       if (tip) tip.textContent = on ? (unconfirmed ? 'Выключить субтитры (синхронизация не подтверждена)' : 'Выключить субтитры') : waiting ? 'Сверяю субтитры со звуком: ' + Math.round(app.audioProgress() * 100) + '% — нажмите, чтобы включить сразу' : pending ? 'Готовлю субтитры…' : 'Включить субтитры';
     }
+    var syncShown = !!((shown && shown.os_id) || app.calibTrack());
+    var sb = document.querySelectorAll('.ops-sync');
+    for (var j = 0; j < sb.length; j++) sb[j].classList.toggle('hide', !syncShown);
     if (on) app.setCcFill(1, false);
     else if (waiting && app.ui.progress > 0) app.setCcFill(app.ui.progress, false); // известный прогресс проверки по звуку
     else if (pending) app.setCcFill(0, true);
@@ -4171,11 +4288,15 @@ module.exports = function (app) {
     var box = document.createElement('div');
     box.className = 'player-panel__box-buttons ops-box';
     box.appendChild(app.makeButton());
+    box.appendChild(app.makeSyncButton());
     var qbox = quality.parentNode;
     qbox.parentNode.insertBefore(box, qbox.nextSibling);
 
     var more = document.querySelector('.player-panel__mobile-more');
-    if (more) more.parentNode.insertBefore(app.makeButton(), more);
+    if (more) {
+      more.parentNode.insertBefore(app.makeButton(), more);
+      more.parentNode.insertBefore(app.makeSyncButton(), more);
+    }
 
     document.body.classList.add('ops-has-btn');
   };
@@ -4351,7 +4472,21 @@ module.exports = function (app) {
     var toPlayer = app.cueFn(track.os_id);
     var f = app.fileSync(track.os_id);
     var toRef = function (ms) { return ms * f.scale + f.offset * 1000; };
-    var ch = calibration.choices(cues, toPlayer, at * 1000, page);
+    // варианты сдвига: текущая модель, без поправки, каждая гипотеза движка (в том числе отброшенные) —
+    // показываем реплику, звучащую сейчас при каждом из них
+    var maps = [toPlayer];
+    var offs = [app.videoSync().offset * 1000];
+    var addAlt = function (offMs, scale) {
+      for (var q = 0; q < offs.length; q++) if (Math.abs(offs[q] - offMs) < 1000) return;
+      offs.push(offMs);
+      maps.push(function (ms) { return Math.round(toRef(ms) * (scale || 1) + offMs); });
+    };
+    addAlt(0, 1);
+    var sm = app.session && app.session.model;
+    if (sm) sm.used.concat(sm.rejected).forEach(function (h) { addAlt(h.offsetMs, h.scale); });
+    if (app.session && app.session.lowProfile) addAlt(app.session.lowProfile.offsetMs, app.session.lowProfile.scale);
+    if (app.audio && app.audio.wide) addAlt(app.audio.wide.offsetMs, 1);
+    var ch = calibration.choices(cues, maps, at * 1000, page);
     var items = ch.items.map(function (x) {
       return { title: x.text.length > 90 ? x.text.slice(0, 90) + '…' : x.text, subtitle: app.fmtTime(x.playerMs / 1000).slice(0, 8), cue: cues[x.index] };
     });
