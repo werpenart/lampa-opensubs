@@ -344,6 +344,66 @@ module.exports = {
 };
   },
 
+  "calibration/checkpoints": function (module, exports, require) {
+/*
+ * Калибровка пользователем (документ, «Калибровка пользователем»; задача 5).
+ *   choices(cues, toPlayer, atMs, page) — 3 реплики, ближайшие к текущему моменту по текущей модели;
+ *                                       page 1, 2… — следующие тройки («ни одна не подходит»).
+ *   point(cue, toRef, atMs)            — якорь { o, t } в секундах прототипа: момент эталона o звучит в t.
+ *   nextPrompt(beforeMs, afterMs, cls, atMs) — когда попросить вторую точку (или null).
+ *   alreadyInSync(currentOffsetMs, atMs) — «Субтитры уже совпадают»: текущая модель становится ручной точкой.
+ * Время — мс (ADR 6); toPlayer / toRef — функции время реплики → время плеера / эталона.
+ */
+'use strict';
+
+var PER_PAGE = 3;
+var WINDOW_MS = 600000;   // дальше ±10 минут от текущего момента не предлагаем
+var REACTION_MS = 300;    // пользователь узнаёт фразу чуть позже её начала
+var SECOND_AFTER_MS = 600000;
+var SECOND_IF_MS = 1500;
+
+function choices(cues, toPlayer, atMs, page) {
+  page = page || 0;
+  var pool = [];
+  for (var i = 0; i < cues.length; i++) {
+    var p = toPlayer(cues[i].startMs);
+    if (Math.abs(p - atMs) > WINDOW_MS) continue;
+    // звучащая сейчас или только что прозвучавшая реплика — первая; будущие чуть менее вероятны
+    var d = p <= atMs ? atMs - p : (p - atMs) * 1.5;
+    pool.push({ index: i, text: cues[i].text, playerMs: p, rank: d });
+  }
+  pool.sort(function (a, b) { return a.rank - b.rank; });
+  var items = pool.slice(page * PER_PAGE, page * PER_PAGE + PER_PAGE);
+  items.sort(function (a, b) { return a.playerMs - b.playerMs; });
+  return { items: items, more: pool.length > (page + 1) * PER_PAGE };
+}
+
+function point(cue, toRef, atMs) {
+  return { o: Math.round(toRef(cue.startMs)) / 1000, t: Math.max(0, atMs - REACTION_MS) / 1000 };
+}
+
+// Вторая точка нужна, если первая заметно сдвинула модель и это не объяснено пересчётом кадров:
+// возможно, дрейф или локальный скачок — спросим через 10 минут просмотра.
+function nextPrompt(beforeMs, afterMs, cls, atMs) {
+  if (cls === 'drift') return null;
+  if (Math.abs(afterMs - beforeMs) <= SECOND_IF_MS) return null;
+  return atMs + SECOND_AFTER_MS;
+}
+
+function alreadyInSync(currentOffsetMs, atMs) {
+  return { offsetMs: currentOffsetMs, atMs: atMs };
+}
+
+module.exports = {
+  PER_PAGE: PER_PAGE,
+  REACTION_MS: REACTION_MS,
+  choices: choices,
+  point: point,
+  nextPrompt: nextPrompt,
+  alreadyInSync: alreadyInSync
+};
+  },
+
   "engine/decider": function (module, exports, require) {
 /*
  * Decider — что делать с субтитрами при данной модели (таблица правил документа, ADR 3 вариант А).
@@ -1161,6 +1221,159 @@ module.exports = {
 };
   },
 
+  "estimators/audio": function (module, exports, require) {
+/*
+ * Оценщик audio (этап 4, фон): совпадение речи в звуке видео с интервалами показа реплик.
+ *
+ * Признаки кадра (каждые 100 мс, analyzers в прототипе через AnalyserNode):
+ *   e — логарифм энергии полосы речи 300–3400 Гц, f — спектральный поток (всплески новых звуков).
+ * evaluate({ samples, cues, dmaxSec, stepSec, winSec, minSec }) → результат или null:
+ *   samples: [{ t, e, f, s }] — t секунды плеера, s — номер непрерывного отрезка (перемотка = новый);
+ *   cues:    [{ start, end }] — интервалы показа реплик в секундах плеера по текущей модели;
+ *   поиск сдвига в ±dmaxSec: при показанных субтитрах ±15 с (уточнение), без модели шире.
+ *   → { shift, z1, z2, edge, tStart, tEnd, confident } — shift > 0: субтитры надо показывать позже.
+ * hypothesis(result, baseOffsetMs) → Hypothesis (estimator 'audio') с местом проверки.
+ */
+'use strict';
+
+var types = require('../engine/types');
+
+var STEP = 0.1;
+var WIN = 480;   // секунд звука в одной проверке (на реальных сериалах 3 минут мало)
+var MIN = 240;
+// Пороги откалиброваны на фикстурах (ADR 2, 8): GoT S1E1, 10 файлов субтитров × оригинал/дубляж —
+// верный сдвиг +1.8…+3.0 с во всех 40 прогонах, z 2.8–4.9; чужие субтитры (48 прогонов на окно):
+// z не выше 3.34 при поиске ±15 с и не выше 4.22 при ±90 с, у второго пика доля ≥ 0.57.
+var STRONG = { narrowZ: 3.6, wideZ: 4.0, ratio: 0.6 }; // сам по себе подтверждает (правило 7)
+
+// Признаки одного кадра из спектра в дБ (getFloatFrequencyData). prev — спектр прошлого кадра (меняется).
+function frameFeatures(freqDb, hzPerBin, prev) {
+  var speech = 0, flux = 0;
+  for (var i = 1; i < freqDb.length; i++) {
+    var f = i * hzPerBin;
+    if (f < 300 || f > 3400) continue;
+    var db = freqDb[i] > -200 ? freqDb[i] : -200;
+    speech += Math.pow(10, db / 10);
+    if (db > prev[i]) flux += db - prev[i];
+    prev[i] = db;
+  }
+  return { e: Math.log(speech + 1e-12), f: flux };
+}
+
+function zscore(arr) {
+  var n = arr.length, mu = 0, sq = 0, i;
+  for (i = 0; i < n; i++) mu += arr[i];
+  mu /= n;
+  for (i = 0; i < n; i++) sq += (arr[i] - mu) * (arr[i] - mu);
+  var sd = Math.sqrt(sq / n) || 1;
+  for (i = 0; i < n; i++) arr[i] = (arr[i] - mu) / sd;
+  return arr;
+}
+
+// Порог уверенности при узком поиске ниже: меньше вариантов — меньше случайных пиков.
+function needZ(dmax) {
+  return dmax <= 12 ? 3.3 : dmax <= 20 ? 3.6 : 4.0;
+}
+
+function evaluate(o) {
+  var step = o.stepSec || STEP;
+  var win = o.winSec || WIN;
+  var min = o.minSec || MIN;
+  var dmax = o.dmaxSec || 15;
+  var all = o.samples || [];
+  if (all.length < 2) return null;
+  var seg = all[all.length - 1].s;
+  var pts = all.filter(function (x) { return x.s === seg; });
+  if (pts.length < 2) return null;
+  var tEnd = pts[pts.length - 1].t;
+  var tStart = Math.max(pts[0].t, tEnd - win);
+  if (tEnd - tStart < min) return null;
+  pts = pts.filter(function (x) { return x.t >= tStart; });
+
+  var n = Math.floor((tEnd - tStart) / step);
+  var ge = new Float32Array(n), gf = new Float32Array(n);
+  var k = 0, i;
+  for (i = 0; i < n; i++) {
+    var tt = tStart + i * step;
+    while (k < pts.length - 1 && pts[k + 1].t <= tt) k++;
+    ge[i] = pts[k].e;
+    gf[i] = pts[k].f || 0;
+  }
+  // энергия относительно фона ближайших ±3 с (минус скользящая медиана): музыка и шум уходят, речь остаётся
+  var rel = new Float32Array(n);
+  var w = [];
+  for (i = 0; i < n; i++) {
+    w.length = 0;
+    for (var j = Math.max(0, i - 30); j <= Math.min(n - 1, i + 30); j++) w.push(ge[j]);
+    w.sort(function (x, y) { return x - y; });
+    rel[i] = ge[i] - w[w.length >> 1];
+  }
+  zscore(rel);
+  zscore(gf);
+  var g = new Float32Array(n);
+  for (i = 0; i < n; i++) g[i] = rel[i] + gf[i];
+
+  var D = Math.round(dmax / step);
+  var len = n + 2 * D;
+  var ind = new Float32Array(len);
+  var base = tStart - dmax;
+  var cues = o.cues || [];
+  for (var q = 0; q < cues.length; q++) {
+    var c0 = cues[q].start, c1 = cues[q].end;
+    if (c1 < base || c0 > base + len * step) continue;
+    var i0 = Math.max(0, Math.round((c0 - base) / step)), i1 = Math.min(len, Math.round((c1 - base) / step));
+    for (var z = i0; z < i1; z++) ind[z] = 1;
+  }
+
+  // score(d): субтитры, показанные в t − d, совпадают с речью в t
+  var scores = [];
+  var best = -Infinity, bestD = 0;
+  for (var d = -D; d <= D; d++) {
+    var sum = 0;
+    var off = D - d;
+    for (var r = 0; r < n; r++) sum += g[r] * ind[r + off];
+    scores.push(sum);
+    if (sum > best) { best = sum; bestD = d; }
+  }
+  var sm = 0, sq = 0;
+  for (var u = 0; u < scores.length; u++) { sm += scores[u]; sq += scores[u] * scores[u]; }
+  sm /= scores.length;
+  var sd = Math.sqrt(Math.max(1e-12, sq / scores.length - sm * sm));
+  var z1 = (best - sm) / sd;
+  var second = -Infinity;
+  for (var v = 0; v < scores.length; v++) if (Math.abs(v - D - bestD) > 20) second = Math.max(second, scores[v]);
+  var z2 = (second - sm) / sd;
+  var shift = bestD * step;
+  var edge = Math.abs(shift) >= dmax - 2; // пик на краю диапазона поиска — почти наверняка ложный
+  var need = needZ(dmax);
+  var strong = !edge && z2 <= z1 * STRONG.ratio && z1 >= (dmax <= 20 ? STRONG.narrowZ : STRONG.wideZ);
+  return {
+    shift: Math.round(shift * 10) / 10, z1: z1, z2: z2, edge: edge, tStart: tStart, tEnd: tEnd, need: need,
+    confident: strong || (!edge && z1 >= need && z2 <= z1 * 0.7), strong: strong
+  };
+}
+
+// Сдвиг модели после проверки: прежний сдвиг + найденная поправка, в центре окна.
+function hypothesis(res, baseOffsetMs) {
+  var at = Math.round((res.tStart + res.tEnd) / 2 * 1000);
+  return types.hypothesis({
+    estimator: 'audio',
+    kind: 'offset',
+    offsetMs: Math.round(baseOffsetMs + res.shift * 1000),
+    fromMs: at,
+    toMs: at + 1,
+    sigmaMs: 300,
+    confidence: res.strong ? 0.85 : 0.6,
+    evidence: [
+      { what: 'совпадение речи и реплик, z', value: Math.round(res.z1 * 10) / 10, source: 'audio' },
+      { what: 'прослушано, с', value: Math.round(res.tEnd - res.tStart), source: 'audio' }
+    ]
+  });
+}
+
+module.exports = { STEP: STEP, WIN: WIN, MIN: MIN, STRONG: STRONG, frameFeatures: frameFeatures, evaluate: evaluate, hypothesis: hypothesis, needZ: needZ };
+  },
+
   "estimators/cross-subs": function (module, exports, require) {
 /*
  * Оценщик crossSubs: приводит файл субтитров к эталонному (обычно английские того же релиза или того,
@@ -1433,6 +1646,17 @@ require('./legacy/plugin');
   var solver = require('../engine/solver');
   var decider = require('../engine/decider');
   var engineEvents = require('../engine/events').create();
+  var calibration = require('../calibration/checkpoints');
+  var audioEstimator = require('../estimators/audio');
+  // профили (profiles/storage.js): субтитры и видео раздельно, уровни доверия по длительности видео (ADR 4)
+  var profiles = require('../profiles/storage').create({
+    read: function (name) {
+      var v = Lampa.Storage.get(name, '');
+      if (typeof v === 'string' && v) try { v = JSON.parse(v); } catch (e) { v = null; }
+      return v === '' ? null : v;
+    },
+    write: function (name, v) { Lampa.Storage.set(name, v); }
+  });
 
   function log() {
     try {
@@ -1977,7 +2201,8 @@ require('./legacy/plugin');
                   return updateButtons();
                 }
                 s.calibrate = true;
-                notify('Субтитры готовы, но синхронизацию не подтвердить. Нажмите CC, чтобы включить, или выберите фразу в меню субтитров');
+                s.bg = t.os_id;
+                notify('Субтитры готовы, но синхронизацию не подтвердить. Субтитры → «Синхронизировать по фразе» или нажмите CC');
                 updateButtons();
               });
               return;
@@ -2117,20 +2342,18 @@ require('./legacy/plugin');
 
   function round3(x) { return Math.round(x * 1000) / 1000; }
 
-  // --- файл
+  // --- файл (профиль субтитров: файл → эталон)
   function fileSync(fid) {
-    var c = store('opensubs_fsync')[fid];
-    return { scale: (c && c.scale) || 1, offset: (c && c.offset) || 0, known: !!c };
+    var p = profiles.subs.get(fid);
+    return { scale: p.scale, offset: p.offsetMs / 1000, known: p.known };
   }
 
   function setFileSync(fid, f) {
-    var all = store('opensubs_fsync');
-    all[fid] = { scale: f.scale, offset: round3(f.offset), auto: true, t: Date.now() };
-    storeSave('opensubs_fsync', all, 300);
+    profiles.subs.set(fid, { scale: f.scale, offsetMs: f.offset * 1000 });
   }
 
   // --- видео
-  function sourceKey(s) {
+  function sourceBal(s) {
     var bal = '';
     try {
       var last = store('online_last_balanser');
@@ -2140,49 +2363,63 @@ require('./legacy/plugin');
       var m = String(s.data.url || '').match(/^https?:\/\/([^\/]+)\/(?:lite\/)?([a-z0-9_-]+)/i);
       bal = m ? m[1] + '/' + m[2] : '';
     }
-    var voice = typeof s.data.translate === 'string' ? s.data.translate : (s.data.voice_name || '');
-    return String(bal).toLowerCase() + '|' + String(voice).toLowerCase().replace(/\s+/g, ' ').trim();
+    return bal;
   }
 
-  // студия озвучки: «LostFilm», «HDRezka Studio», «Кубик в Кубе»… — заставка у студии одна на все сериалы
-  function studioKey(s) {
-    var v = [typeof s.data.translate === 'string' ? s.data.translate : '', s.data.voice_name || ''].join(' ').toLowerCase();
-    v = v.replace(/\b(\d{3,4}p|4k|uhd|hdr|sdr|fhd|hd)\b|\(.*?\)|[|·•\-_.,]/g, ' ').replace(/\s+/g, ' ').trim();
-    return v ? 'studio|' + v : '';
-  }
-
-  function videoKeys(s) {
-    var src = s.card.id + '|' + sourceKey(s);
+  // ключ профиля видео: фильм/серия + источник + озвучка
+  function videoKey(s) {
     var ep = episodeInfo(s.data);
-    return { exact: src + (ep ? '|' + ep.season + 'x' + ep.episode : ''), source: src, studio: studioKey(s) };
+    return {
+      card: s.card.id,
+      season: ep ? ep.season : null,
+      episode: ep ? ep.episode : null,
+      balancer: sourceBal(s),
+      voice: typeof s.data.translate === 'string' ? s.data.translate : (s.data.voice_name || '')
+    };
+  }
+
+  function currentDurationMs(s) {
+    return s.probe && s.probe.durationMs ? s.probe.durationMs : null;
   }
 
   function videoSync() {
     var s = session;
     if (!s) return { scale: 1, offset: 0, anchors: [] };
     if (!s.vsync) {
-      var k = videoKeys(s);
-      var c = store('opensubs_vsync3')[k.exact];
-      // догадки «как у прошлой серии / как у студии» убраны: заставки у одной студии в разных сериалах разные
-      s.vsync = c ? { scale: c.scale, offset: c.offset, pieces: c.pieces || null, anchors: c.anchors || [], manual: !!c.manual, src: c.src }
+      var hit = profiles.video.lookup(videoKey(s), currentDurationMs(s));
+      var c = hit && hit.record;
+      s.vsyncLevel = hit ? hit.level : null;
+      // профиль другого видеорелиза под тем же именем — не применяем, только гипотеза (ADR 4)
+      if (c && hit.level === 'low') {
+        s.lowProfile = c;
+        c = null;
+      }
+      s.vsync = c ? { scale: c.scale, offset: c.offsetMs / 1000, pieces: c.pieces || null, anchors: c.anchors || [], manual: !!c.manual, src: c.src }
         : { scale: 1, offset: 0, anchors: [] };
     }
     return s.vsync;
+  }
+
+  // длительность видео стала известна после чтения профиля — проверить, тот ли это видеорелиз
+  function revalidateProfile(s, videoMs) {
+    var hit = profiles.video.lookup(videoKey(s), videoMs);
+    if (!hit || hit.level !== 'low' || s.vsyncLevel === 'low') return;
+    log('профиль записан для другой длительности видео — только гипотеза');
+    s.lowProfile = hit.record;
+    s.vsyncLevel = 'low';
+    s.vsync = { scale: 1, offset: 0, anchors: [] };
   }
 
   function setVideoSync(v) {
     var s = session;
     if (!s) return;
     s.vsync = v;
-    var k = videoKeys(s);
-    var all = store('opensubs_vsync3');
-    if (v.scale === 1 && !v.offset && !v.anchors.length && !v.src) delete all[k.exact];
-    else {
-      var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : round3(s.durDiff);
-      all[k.exact] = { scale: v.scale, offset: round3(v.offset), pieces: v.pieces || undefined, anchors: v.anchors.slice(-8), manual: !!v.manual, src: v.src, dd: dd, t: Date.now() };
-    }
-    storeSave('opensubs_vsync3', all, 500);
-    try { localStorage.removeItem('opensubs_vprior'); localStorage.removeItem('opensubs_vsync'); } catch (e) {} // старые догадки
+    var k = videoKey(s);
+    if (v.scale === 1 && !v.offset && !v.anchors.length && !v.src) return profiles.video.remove(k);
+    var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : round3(s.durDiff);
+    profiles.video.set(k, { scale: v.scale, offsetMs: v.offset * 1000, pieces: v.pieces, anchors: v.anchors, manual: v.manual, src: v.src,
+      durationMs: currentDurationMs(s), dd: dd });
+    s.vsyncLevel = 'high';
   }
 
   function composed(fid) {
@@ -2328,6 +2565,10 @@ require('./legacy/plugin');
     if (s.release) hs = hs.concat(s.release.hypotheses);
     if (s.fpsHyp) hs.push(s.fpsHyp);
     if (s.profileHyp) hs.push(s.profileHyp);
+    if (s.lowProfile) {
+      hs.push({ estimator: 'profile', kind: 'offset', offsetMs: Math.round(s.lowProfile.offsetMs), sigmaMs: 3000, confidence: 0.3,
+        evidence: [{ what: 'профиль другого видеорелиза', value: s.lowProfile.durationMs || null, source: 'profile' }] });
+    }
     return hs.concat(anchorHyps(v || videoSync()));
   }
 
@@ -2475,16 +2716,16 @@ require('./legacy/plugin');
     return { url: s.data.url, card: s.card, episode: episodeInfo(s.data), balancer: bal };
   }
 
-  function residualKey(s) {
+  function platformKey(s) {
     var info = lampacApi.info(lampacCtx(s));
-    return info ? s.card.id + '|' + info.bal : null;
+    return info ? { card: s.card.id, balancer: info.bal } : null;
   }
 
+  // отбивка площадки, выученная на другой серии этого сериала у этого источника (секунды) — только гипотеза
   function residual(s) {
-    var k = residualKey(s);
-    var r = k && store('opensubs_resid3')[k];
-    if (r) return r.o;
-    return null;
+    var k = platformKey(s);
+    var ms = k && profiles.platform.get(k);
+    return typeof ms === 'number' ? ms / 1000 : null;
   }
 
   // пользователь поправил вручную при известной заставке озвучки → остаток = заставка площадки
@@ -2493,13 +2734,11 @@ require('./legacy/plugin');
     if (!s || s.durDiff === null || typeof s.durDiff === 'undefined') return;
     var v = videoSync();
     if (Math.abs(v.scale - 1) > 0.0005) return;
-    var k = residualKey(s);
+    var k = platformKey(s);
     if (!k) return;
-    var all = store('opensubs_resid3');
     var o = round3(v.offset - s.durDiff);
     if (Math.abs(o) > 60) return;
-    all[k] = { o: o, t: Date.now() };
-    storeSave('opensubs_resid3', all, 300);
+    profiles.platform.set(k, o * 1000);
     log('заставка площадки для сериала:', o);
   }
 
@@ -2558,6 +2797,7 @@ require('./legacy/plugin');
       }
       var withVideo = function (videoMs, exact) {
         if (session !== s) return;
+        revalidateProfile(s, videoMs);
         var rel = diagnostics.diagnose({ videoMs: videoMs, exact: exact, originals: origs });
         s.release = rel;
         s.durStatus = rel.text;
@@ -2631,9 +2871,7 @@ require('./legacy/plugin');
 
   var audio = null;
   var audioDenied = ''; // почему подстройка по звуку не работает (для меню)
-  var AUDIO_STEP = 0.1;
-  var AUDIO_WIN = 480; // секунд звука в одной проверке (на реальных сериалах 3 минут мало)
-  var AUDIO_MIN = 240;
+  var AUDIO_MIN = audioEstimator.MIN;
   var AUDIO_TARGET = 360; // столько слушаем до показа без уверенности (это же 100% на иконке)
 
   function audioStop() {
@@ -2701,19 +2939,14 @@ require('./legacy/plugin');
       a.lastT = t;
       a.analyser.getFloatFrequencyData(a.freq);
       var hz = a.ctx.sampleRate / 2 / a.freq.length;
-      if (!a.prev) a.prev = new Float32Array(a.freq.length);
-      // энергия полосы речи (лог) и спектральный поток — «всплески» новых звуков в этой полосе
-      var speech = 0, flux = 0;
-      for (var i = 1; i < a.freq.length; i++) {
-        var f = i * hz;
-        if (f < 300 || f > 3400) continue;
-        var db = a.freq[i] > -200 ? a.freq[i] : -200;
-        speech += Math.pow(10, db / 10);
-        if (db > a.prev[i]) flux += db - a.prev[i];
-        a.prev[i] = db;
+      if (!a.prev) {
+        a.prev = new Float32Array(a.freq.length);
+        for (var pi = 0; pi < a.prev.length; pi++) a.prev[pi] = -200;
       }
+      // энергия полосы речи (лог) и спектральный поток — estimators/audio.js
+      var ft = audioEstimator.frameFeatures(a.freq, hz, a.prev);
       if (!a.evals) a.status = 'слушает: ' + Math.round(a.samples.length / 10) + ' с из ' + AUDIO_MIN + ' нужных';
-      a.samples.push({ t: t, e: Math.log(speech + 1e-12), f: flux, s: a.seg });
+      a.samples.push({ t: t, e: ft.e, f: ft.f, s: a.seg });
       if (a.samples.length > 6000) a.samples.splice(0, a.samples.length - 6000);
       if (Date.now() - a.lastEval > 30000) {
         a.lastEval = Date.now();
@@ -2736,108 +2969,44 @@ require('./legacy/plugin');
       return;
     }
 
-    // непрерывный кусок последних AUDIO_WIN секунд
-    var seg = a.samples.length ? a.samples[a.samples.length - 1].s : -1;
-    var pts = a.samples.filter(function (x) { return x.s === seg; });
-    if (pts.length < 2) return;
-    var tEnd = pts[pts.length - 1].t;
-    var tStart = Math.max(pts[0].t, tEnd - AUDIO_WIN);
-    if (tEnd - tStart < AUDIO_MIN) return;
-    pts = pts.filter(function (x) { return x.t >= tStart; });
-
-    var n = Math.floor((tEnd - tStart) / AUDIO_STEP);
-    var ge = new Float32Array(n), gf = new Float32Array(n);
-    var k = 0;
-    for (var i = 0; i < n; i++) {
-      var tt = tStart + i * AUDIO_STEP;
-      while (k < pts.length - 1 && pts[k + 1].t <= tt) k++;
-      ge[i] = pts[k].e;
-      gf[i] = pts[k].f || 0;
-    }
-    // энергия относительно фона ближайших ±3 с (вычитаем скользящую медиану): музыка и шум уходят, речь остаётся
-    var rel = new Float32Array(n);
-    var win = [];
-    for (var i2 = 0; i2 < n; i2++) {
-      win.length = 0;
-      for (var j2 = Math.max(0, i2 - 30); j2 <= Math.min(n - 1, i2 + 30); j2++) win.push(ge[j2]);
-      win.sort(function (x, y) { return x - y; });
-      rel[i2] = ge[i2] - win[win.length >> 1];
-    }
-    var zs = function (arr) {
-      var mu = 0, sq2 = 0;
-      for (var q1 = 0; q1 < n; q1++) mu += arr[q1];
-      mu /= n;
-      for (var q2 = 0; q2 < n; q2++) sq2 += (arr[q2] - mu) * (arr[q2] - mu);
-      var sd1 = Math.sqrt(sq2 / n) || 1;
-      for (var q3 = 0; q3 < n; q3++) arr[q3] = (arr[q3] - mu) / sd1;
-      return arr;
-    };
-    zs(rel);
-    zs(gf);
-    var g = new Float32Array(n);
-    for (var m = 0; m < n; m++) g[m] = rel[m] + gf[m];
-
     var c = composed(track.os_id);
     var cues = parseCues(texts[track.os_id]);
     var vs = videoSync();
     // после расчёта по длительности остаётся только заставка площадки и разница релизов — ищем рядом
     // широкий поиск (±90 с) — только пока субтитры скрыты и ждут проверки; при показе звук лишь доводит время
     var dmax = s0 && s0.waiting && !vs.anchors.length && vs.src !== 'duration' ? 90 : 15;
-    var D = Math.round(dmax / AUDIO_STEP);
-    var len = n + 2 * D;
-    var ind = new Float32Array(len); // показ субтитров на сетке [tStart − dmax, tEnd + dmax]
-    var base = tStart - dmax;
-    for (var q = 0; q < cues.length; q++) {
-      var s0 = cues[q].start * c.scale + c.offset, s1 = cues[q].end * c.scale + c.offset;
-      if (s1 < base || s0 > base + len * AUDIO_STEP) continue;
-      var i0 = Math.max(0, Math.round((s0 - base) / AUDIO_STEP)), i1 = Math.min(len, Math.round((s1 - base) / AUDIO_STEP));
-      for (var z = i0; z < i1; z++) ind[z] = 1;
-    }
-
-    // score(d): субтитры, показанные в t − d, совпадают с речью в t
-    var scores = [];
-    var best = -Infinity, bestD = 0;
-    for (var d = -D; d <= D; d++) {
-      var sum = 0;
-      var off = D - d;
-      for (var r = 0; r < n; r++) sum += g[r] * ind[r + off];
-      scores.push(sum);
-      if (sum > best) { best = sum; bestD = d; }
-    }
-    var sm = 0, sq = 0;
-    for (var u = 0; u < scores.length; u++) { sm += scores[u]; sq += scores[u] * scores[u]; }
-    sm /= scores.length;
-    var sd = Math.sqrt(Math.max(1e-12, sq / scores.length - sm * sm));
-    var z1 = (best - sm) / sd;
-    var second = -Infinity;
-    for (var w = 0; w < scores.length; w++) if (Math.abs(w - D - bestD) > 20) second = Math.max(second, scores[w]);
-    var z2 = (second - sm) / sd;
-    var shift = bestD * AUDIO_STEP;
-    var edge = Math.abs(shift) >= dmax - 2; // пик на краю диапазона поиска — почти наверняка ложный
-    log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1));
+    var res = audioEstimator.evaluate({
+      samples: a.samples,
+      cues: cues.map(function (q) { return { start: q.start * c.scale + c.offset, end: q.end * c.scale + c.offset }; }),
+      dmaxSec: dmax
+    });
+    if (!res) return;
+    var shift = res.shift, z1 = res.z1, z2 = res.z2;
+    log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1), res.strong ? 'сильное' : '');
     a.evals = (a.evals || 0) + 1;
-    var need = dmax <= 12 ? 3.3 : dmax <= 20 ? 3.6 : 4.0; // при узком поиске хватает меньшей уверенности
+    var need = res.need;
     // одинаковый сдвиг в двух проверках подряд — тоже уверенность, даже если каждая чуть ниже порога
     var prevE = a.lastShift;
     a.lastShift = { d: shift, z: z1 };
     var agree = prevE && Math.abs(prevE.d - shift) <= 0.3 && prevE.z >= need - 0.5 && z1 >= need - 0.5 && z2 <= z1 * 0.7;
-    if (edge || (!agree && (z1 < need || z2 > z1 * 0.7))) {
-      a.status = 'слушает ' + Math.round(tEnd - tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
-      // полное окно прослушано, а уверенности нет — показываем как есть
-      if (s0 && s0.waiting && tEnd - tStart >= AUDIO_TARGET) finishBackground('нет уверенности');
+    if (res.edge || (!agree && !res.confident)) {
+      a.status = 'слушает ' + Math.round(res.tEnd - res.tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
+      // полное окно прослушано, а уверенности нет — не показываем вслепую (Decider), предлагаем калибровку
+      if (s0 && s0.waiting && res.tEnd - res.tStart >= AUDIO_TARGET) finishBackground('нет уверенности');
       return;
     }
     a.status = 'последняя проверка: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с (уверенность ' + z1.toFixed(1) + ')';
 
-    var center = (tStart + tEnd) / 2;
+    var center = (res.tStart + res.tEnd) / 2;
     var o = (center - vs.offset) / vs.scale;
-    // z ≥ 4.5 сам по себе подтверждает (правило 7); слабее — только вместе с кандидатом вставки (ADR 3)
-    addAnchor(o, center + shift, 'audio', z1 >= 4.5 && !agree ? 0.85 : agree && z1 >= 4.5 ? 0.9 : 0.6);
+    // сильное совпадение подтверждает само (правило 7); слабее — вместе с кандидатом вставки или повтором
+    addAnchor(o, center + shift, 'audio', res.strong || agree ? 0.85 : 0.6);
     finishBackground('ok');
     if (!a.told && Math.abs(shift) >= 1) {
       a.told = true;
       notify('Субтитры подстроены по звуку: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с');
     }
+    engineEvents.emit('progress', { value: 1 });
   }
 
   // ---------- меню синхронизации ----------
@@ -2887,7 +3056,7 @@ require('./legacy/plugin');
       ],
       onBack: back,
       onSelect: function (a) {
-        if (a.name === 'phrase') return phraseMenu(track, reopen, root);
+        if (a.name === 'phrase') return calibrationMenu(track, reopen, root);
 
         if (a.name === 'dur') {
           var on = flag('durationsync', true);
@@ -2968,18 +3137,94 @@ require('./legacy/plugin');
     });
   }
 
-  function phraseMenu(track, reopen, root) {
+  // Калибровка (calibration/checkpoints.js): 3 реплики вокруг текущего момента по текущей модели,
+  // «ни одна не подходит» — следующие 3, «уже совпадают» — текущая модель становится ручной.
+  function calibrationMenu(track, reopen, root, page, at, wasPlaying) {
+    var text = texts[track.os_id] || '';
+    var cues = subtitle.parse(text);
+    if (!cues.length) {
+      Lampa.Noty.show('Не удалось прочитать файл субтитров');
+      return reopen();
+    }
+    page = page || 0;
+    var vid = null;
+    try { vid = Lampa.PlayerVideo.video(); } catch (e) {}
+    if (typeof at !== 'number') {
+      at = videoTime();
+      wasPlaying = vid && !vid.paused;
+      if (wasPlaying) try { vid.pause(); } catch (e) {}
+    }
+    var resume = function () {
+      if (wasPlaying) try { vid.play(); } catch (e) {}
+    };
+    var toPlayer = cueFn(track.os_id);
+    var f = fileSync(track.os_id);
+    var toRef = function (ms) { return ms * f.scale + f.offset * 1000; };
+    var ch = calibration.choices(cues, toPlayer, at * 1000, page);
+    var items = ch.items.map(function (x) {
+      return { title: x.text.length > 90 ? x.text.slice(0, 90) + '…' : x.text, subtitle: fmtTime(x.playerMs / 1000).slice(0, 8), cue: cues[x.index] };
+    });
+    if (ch.more) items.push({ title: 'Ни одна не подходит', subtitle: 'Показать другие реплики', act: 'more' });
+    items.push({ title: 'Субтитры уже совпадают', subtitle: 'Запомнить текущую синхронизацию', act: 'ok' });
+    items.push({ title: 'Полный список реплик', act: 'list' });
+
+    closeSelects();
+    Lampa.Select.show({
+      title: 'Какая фраза звучит сейчас?',
+      nohide: true,
+      items: items,
+      onBack: function () {
+        resume();
+        reopen();
+      },
+      onSelect: function (b) {
+        if (b.act === 'more') return calibrationMenu(track, reopen, root, page + 1, at, wasPlaying);
+        if (b.act === 'list') return phraseMenu(track, reopen, root, at, wasPlaying);
+        var s = session;
+        if (b.act === 'ok') {
+          var v0 = videoSync();
+          addAnchor((at - v0.offset) / v0.scale, at, 'phrase');
+          Lampa.Noty.show('Синхронизация запомнена');
+        } else {
+          var before = videoSync().offset;
+          var pt = calibration.point(b.cue, toRef, at * 1000);
+          var v = addAnchor(pt.o, pt.t, 'phrase');
+          var next = calibration.nextPrompt(before * 1000, v.offset * 1000, s && s.model ? s.model['class'] : 'constant', at * 1000);
+          if (s) s.secondAt = next;
+          Lampa.Noty.show(next ? 'Сдвиг подобран. Через 10 минут предложу проверить ещё раз' : 'Сдвиг подобран');
+        }
+        if (s) s.calibrate = false;
+        if (!isShowing()) {
+          setCc(true);
+          showTrack(track);
+        }
+        resume();
+        root();
+      }
+    });
+  }
+
+  // вторая точка калибровки: подсказка, а не диалог посреди сцены
+  function checkSecondPrompt() {
+    var s = session;
+    if (!s || !s.secondAt || !isShowing()) return;
+    if (videoTime() * 1000 < s.secondAt) return;
+    s.secondAt = null;
+    notify('Проверьте синхронизацию: Субтитры → Синхронизация → По фразе');
+  }
+
+  function phraseMenu(track, reopen, root, atGiven, playingGiven) {
     var cues = parseCues(texts[track.os_id] || '');
     if (!cues.length) {
       Lampa.Noty.show('Не удалось прочитать файл субтитров');
       return reopen();
     }
     var c = composed(track.os_id);
-    var at = videoTime();
+    var at = typeof atGiven === 'number' ? atGiven : videoTime();
     var vid = null;
     try { vid = Lampa.PlayerVideo.video(); } catch (e) {}
-    var wasPlaying = vid && !vid.paused;
-    if (wasPlaying) try { vid.pause(); } catch (e) {}
+    var wasPlaying = typeof atGiven === 'number' ? playingGiven : vid && !vid.paused;
+    if (wasPlaying && typeof atGiven !== 'number') try { vid.pause(); } catch (e) {}
     var resume = function () {
       if (wasPlaying) try { vid.play(); } catch (e) {}
     };
@@ -3179,6 +3424,16 @@ require('./legacy/plugin');
     else Lampa.Select.close();
   }
 
+  // дорожка для калибровки: показанная неподтверждённая или скрытая после неудачной проверки
+  function calibTrack() {
+    var s = session;
+    if (!s) return null;
+    var on = isShowing();
+    if (on && on.os_id && s.decision && s.decision.marker === 'unconfirmed' && !videoSync().manual) return on;
+    if (s.calibrate && s.bg) return findTrack(s.bg);
+    return null;
+  }
+
   function menu(back) {
     var subs = trackList();
     var on = null;
@@ -3192,13 +3447,15 @@ require('./legacy/plugin');
         { title: 'Размер шрифта', subtitle: titleOf(SIZES, setting('size', 'auto')), name: 'size' },
         { title: 'Тень шрифта', subtitle: titleOf(SHADOWS, setting('shadow', 'auto')), name: 'shadow' },
         { title: 'Синхронизация', subtitle: on && on.os_id ? syncTitle() : 'Для субтитров OpenSubtitles', name: 'sync' }
-      ],
+      ].concat(calibTrack() ? [{ title: 'Синхронизировать по фразе', subtitle: 'Синхронизация не подтверждена — выберите реплику, которая звучит', name: 'calib' }] : []),
       onBack: back,
       onSelect: function (a) {
         var again = function () {
           closeSelects();
           menu(back);
         };
+
+        if (a.name === 'calib') return calibrationMenu(calibTrack(), again, back);
 
         if (a.name === 'lang') {
           var items = [{ title: 'Выключены', selected: !on, act: 'off' }];
@@ -3298,7 +3555,10 @@ require('./legacy/plugin');
       if (tip) tip.textContent = on ? (unconfirmed ? 'Выключить субтитры (синхронизация не подтверждена)' : 'Выключить субтитры') : waiting ? 'Сверяю субтитры со звуком: ' + Math.round(audioProgress() * 100) + '% — нажмите, чтобы включить сразу' : pending ? 'Готовлю субтитры…' : 'Включить субтитры';
     }
     if (on) setCcFill(1, false);
-    else if (waiting && audio && audio.samples.length) setCcFill(audioProgress(), false); // известный прогресс
+    else if (waiting && audio && audio.samples.length) {
+      setCcFill(audioProgress(), false); // известный прогресс
+      engineEvents.emit('progress', { value: audioProgress() });
+    }
     else if (pending) setCcFill(0, true);
     else setCcFill(0, false);
   }
@@ -3461,7 +3721,7 @@ require('./legacy/plugin');
       addButton();
       applyStyle();
       clearInterval(timer);
-      timer = setInterval(updateButtons, 1000);
+      timer = setInterval(function () { updateButtons(); checkSecondPrompt(); }, 1000);
       audioStop();
       current = null;
       revokeUrls(); // файлы прошлого видео больше не нужны
@@ -3473,6 +3733,7 @@ require('./legacy/plugin');
       audioStop();
     });
     try { localStorage.removeItem('opensubs_links'); } catch (e) {} // кеш ссылок из первой версии
+    try { if (profiles.migrate()) log('профили перенесены из прежних ключей'); } catch (e) { log('перенос профилей:', e); }
   }
 
   if (window.appready) start();
@@ -3670,6 +3931,143 @@ module.exports = {
     done(types.probeInfo({ source: 'unknown' }));
   }
 };
+  },
+
+  "profiles/storage": function (module, exports, require) {
+/*
+ * ProfileStore (этап 6, ADR 4): профили субтитров и профили видео хранятся раздельно.
+ *   субтитры: file_id → { scale, offsetMs, refRelease, auto, t }      — файл → эталон (crossSubs);
+ *   видео:    ключ серии+источника+озвучки → { scale, offsetMs, pieces, anchors, manual, src,
+ *             durationMs, dd, t }                                      — эталон → это видео;
+ *   площадка: сериал+источник → { offsetMs, t }                       — отбивка площадки, выученная на другой серии.
+ *
+ * Уровни доверия при чтении профиля видео (lookup):
+ *   high   — та же серия, источник, озвучка и длительность видео (±100 мс) — применить и показать;
+ *   medium — то же, но длительность неизвестна (старые записи) — применить, статус по остальным доказательствам;
+ *   low    — длительность другая (другой видеорелиз под тем же именем) — только гипотеза, без автопоказа.
+ * Соседняя серия той же озвучки — только гипотеза (platform), студия — не основание (ADR 4).
+ *
+ * var store = require('./storage').create({ read(name) → object, write(name, object) });
+ * Старые ключи прототипа (opensubs_fsync, opensubs_vsync3, opensubs_resid3) переносятся migrate().
+ */
+'use strict';
+
+var NAMES = { subs: 'opensubs_sprof', video: 'opensubs_vprof', platform: 'opensubs_pprof', version: 'opensubs_prof_v' };
+var LIMITS = { subs: 300, video: 500, platform: 300 };
+var SAME_DURATION_MS = 100;
+
+function prune(all, max) {
+  var keys = Object.keys(all);
+  if (keys.length <= max) return all;
+  keys.sort(function (a, b) { return (all[a].t || 0) - (all[b].t || 0); });
+  for (var i = 0; i < keys.length - max; i++) delete all[keys[i]];
+  return all;
+}
+
+function round(x) {
+  return Math.round(x);
+}
+
+// Ключ видео: фильм/серия + источник + озвучка (как в прототипе: card|bal|voice[|SxE]).
+function videoKey(k) {
+  var ep = k.season && k.episode ? '|' + k.season + 'x' + k.episode : '';
+  return k.card + '|' + String(k.balancer || '').toLowerCase() + '|' +
+    String(k.voice || '').toLowerCase().replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '') + ep;
+}
+
+function platformKey(k) {
+  return k.card + '|' + String(k.balancer || '').toLowerCase();
+}
+
+function create(io, now) {
+  now = now || function () { return Date.now(); };
+  var cache = {};
+  function all(name) {
+    if (!cache[name]) {
+      var v = io.read(name);
+      cache[name] = v && typeof v === 'object' ? v : {};
+    }
+    return cache[name];
+  }
+  function save(name, max) {
+    io.write(name, prune(all(name), max));
+  }
+
+  var subs = {
+    get: function (fileId) {
+      var c = all(NAMES.subs)[fileId];
+      return c ? { scale: c.scale || 1, offsetMs: c.offsetMs || 0, refRelease: c.refRelease || null, auto: !!c.auto, known: true }
+        : { scale: 1, offsetMs: 0, refRelease: null, auto: false, known: false };
+    },
+    set: function (fileId, p) {
+      all(NAMES.subs)[fileId] = { scale: p.scale, offsetMs: round(p.offsetMs), refRelease: p.refRelease || undefined, auto: p.auto !== false, t: now() };
+      save(NAMES.subs, LIMITS.subs);
+    }
+  };
+
+  var video = {
+    // → { record, level: 'high' | 'medium' | 'low' } | null
+    lookup: function (key, durationMs) {
+      var r = all(NAMES.video)[videoKey(key)];
+      if (!r) return null;
+      var level = 'medium';
+      if (r.durationMs && durationMs) level = Math.abs(r.durationMs - durationMs) <= SAME_DURATION_MS ? 'high' : 'low';
+      return { record: r, level: level };
+    },
+    set: function (key, v) {
+      var rec = {
+        scale: v.scale, offsetMs: round(v.offsetMs), pieces: v.pieces || undefined, anchors: (v.anchors || []).slice(-8),
+        manual: !!v.manual, src: v.src || undefined, durationMs: v.durationMs || undefined,
+        dd: v.dd === null || v.dd === undefined ? undefined : v.dd, t: now()
+      };
+      all(NAMES.video)[videoKey(key)] = rec;
+      save(NAMES.video, LIMITS.video);
+      return rec;
+    },
+    remove: function (key) {
+      delete all(NAMES.video)[videoKey(key)];
+      save(NAMES.video, LIMITS.video);
+    }
+  };
+
+  var platform = {
+    get: function (key) {
+      var r = all(NAMES.platform)[platformKey(key)];
+      return r ? r.offsetMs : null;
+    },
+    set: function (key, offsetMs) {
+      all(NAMES.platform)[platformKey(key)] = { offsetMs: round(offsetMs), t: now() };
+      save(NAMES.platform, LIMITS.platform);
+    }
+  };
+
+  // Перенос записей прототипа (секунды → мс). Старые ключи не трогаем: откат на старую версию не теряет поправки.
+  function migrate() {
+    if (io.read(NAMES.version) === 1) return false;
+    var oldF = io.read('opensubs_fsync') || {};
+    var oldV = io.read('opensubs_vsync3') || {};
+    var oldR = io.read('opensubs_resid3') || {};
+    var k;
+    var sp = all(NAMES.subs), vp = all(NAMES.video), pp = all(NAMES.platform);
+    for (k in oldF) if (!sp[k]) sp[k] = { scale: oldF[k].scale || 1, offsetMs: round((oldF[k].offset || 0) * 1000), auto: !!oldF[k].auto, t: oldF[k].t || 0 };
+    for (k in oldV) {
+      if (vp[k]) continue;
+      var o = oldV[k];
+      vp[k] = { scale: o.scale || 1, offsetMs: round((o.offset || 0) * 1000), pieces: o.pieces || undefined, anchors: o.anchors || [],
+        manual: !!o.manual, src: o.src || undefined, dd: o.dd, t: o.t || 0 };
+    }
+    for (k in oldR) if (!pp[k]) pp[k] = { offsetMs: round((oldR[k].o || 0) * 1000), t: oldR[k].t || 0 };
+    save(NAMES.subs, LIMITS.subs);
+    save(NAMES.video, LIMITS.video);
+    save(NAMES.platform, LIMITS.platform);
+    io.write(NAMES.version, 1);
+    return true;
+  }
+
+  return { subs: subs, video: video, platform: platform, migrate: migrate };
+}
+
+module.exports = { create: create, NAMES: NAMES, videoKey: videoKey, platformKey: platformKey, SAME_DURATION_MS: SAME_DURATION_MS };
   }
   };
 
