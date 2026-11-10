@@ -6,6 +6,188 @@
  */
 (function () {
   var defs = {
+  "analyzers/audio-capture": function (module, exports, require) {
+/*
+ * Захват звука видео (captureStream → AnalyserNode) и фоновая проверка оценщиком audio.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+var audioEstimator = require('../estimators/audio');
+
+module.exports = function (app) {
+  // включить субтитры на нужном языке: субтитры источника на этом языке, иначе лучший файл OpenSubtitles
+  // Можно ли синхронизировать по звуку до показа (встроенный плеер с доступом к звуку)
+  app.canListen = function canListen() {
+    if (!app.flag('audiosync', true)) return false;
+    try {
+      var v = Lampa.PlayerVideo.video();
+      return !!(v && v.captureStream);
+    } catch (e) {
+      return false;
+    }
+  };
+
+
+  // ---------- подстройка по звуку ----------
+  // Звук видео (captureStream, воспроизведение не затрагивается) → доля энергии в полосе речи каждые 100 мс.
+  // Раз в 30 с последние 3 минуты сравниваются с интервалами показа субтитров: сдвиг с максимальной корреляцией
+  // и есть поправка. Так находится заставка студии (LostFilm, HDRezka…) и уползание из-за частоты кадров.
+  app.audio = null;
+
+  app.audioDenied = '';
+
+  app.AUDIO_MIN = audioEstimator.MIN;
+
+  app.AUDIO_TARGET = 360;
+
+  app.audioStop = function audioStop() {
+    if (!app.audio) return;
+    clearInterval(app.audio.timer);
+    try { app.audio.ctx.close(); } catch (e) {}
+    app.audio = null;
+  };
+
+  app.audioStart = function audioStart() {
+    if (!app.flag('audiosync', true)) return;
+    var v = null;
+    try { v = Lampa.PlayerVideo.video(); } catch (e) {}
+    if (!v || !v.captureStream) { // mozCaptureStream в Firefox глушит звук видео — не используем
+      app.audioDenied = 'этот плеер не даёт доступ к звуку';
+      return;
+    }
+    app.audioDenied = '';
+    if (app.audio && app.audio.video === v) return;
+    app.audioStop();
+
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    app.audio = { video: v, samples: [], seg: 0, lastT: -1, lastEval: 0, ctx: null, analyser: null, told: false, fails: 0, status: 'ждёт звук видео' };
+    var a = app.audio;
+
+    var connect = function () {
+      if (a !== app.audio || a.analyser) return;
+      var stream;
+      try { stream = v.captureStream(); } catch (e) { // чужой домен без CORS
+        app.log('звук недоступен', e && e.message);
+        app.audioDenied = 'браузер не даёт читать звук этого видео (другой домен)';
+        app.audioStop();
+        return app.finishBackground('нет доступа к звуку');
+      }
+      if (!stream.getAudioTracks().length) return; // дорожка появится после начала воспроизведения
+      try {
+        a.ctx = a.ctx || new Ctx();
+        var src = a.ctx.createMediaStreamSource(stream);
+        var an = a.ctx.createAnalyser();
+        an.fftSize = 1024;
+        an.smoothingTimeConstant = 0;
+        var mute = a.ctx.createGain();
+        mute.gain.value = 0;
+        src.connect(an);
+        an.connect(mute);
+        mute.connect(a.ctx.destination); // анализатор должен быть в графе; звук нулевой
+        a.analyser = an;
+        a.freq = new Float32Array(an.frequencyBinCount);
+        if (a.ctx.state === 'suspended' && a.ctx.resume) a.ctx.resume();
+      } catch (e) {
+        app.log('звук недоступен', e && e.message);
+        app.audioDenied = 'ошибка анализа звука: ' + (e && e.message);
+        app.audioStop();
+        app.finishBackground('ошибка звука');
+      }
+    };
+
+    a.timer = setInterval(function () {
+      if (a !== app.audio) return;
+      if (!a.analyser) return connect();
+      if (v.paused || v.seeking || v.readyState < 2) return;
+      var t = v.currentTime;
+      if (a.lastT >= 0 && (t < a.lastT || t - a.lastT > 2)) a.seg++; // перемотка — новый отрезок
+      a.lastT = t;
+      a.analyser.getFloatFrequencyData(a.freq);
+      var hz = a.ctx.sampleRate / 2 / a.freq.length;
+      if (!a.prev) {
+        a.prev = new Float32Array(a.freq.length);
+        for (var pi = 0; pi < a.prev.length; pi++) a.prev[pi] = -200;
+      }
+      // энергия полосы речи (лог) и спектральный поток — estimators/audio.js
+      var ft = audioEstimator.frameFeatures(a.freq, hz, a.prev);
+      if (!a.evals) a.status = 'слушает: ' + Math.round(a.samples.length / 10) + ' с из ' + app.AUDIO_MIN + ' нужных';
+      a.samples.push({ t: t, e: ft.e, f: ft.f, s: a.seg });
+      if (a.samples.length % 10 === 0) app.engineEvents.emit('progress', { value: app.audioProgress() });
+      if (a.samples.length > 6000) a.samples.splice(0, a.samples.length - 6000);
+      if (Date.now() - a.lastEval > 30000) {
+        a.lastEval = Date.now();
+        setTimeout(app.audioEvaluate, 0);
+      }
+    }, 100);
+    connect();
+  };
+
+  app.audioEvaluate = function audioEvaluate() {
+    var a = app.audio;
+    var s0 = app.session;
+    var track = (s0 && s0.waiting && s0.bg && app.findTrack(s0.bg)) || app.isShowing();
+    if (!a || !track || !track.os_id || !app.texts[track.os_id]) return;
+    if (s0 && s0.waiting && Date.now() - s0.waiting > 7 * 60 * 1000) return app.finishBackground('долго нет результата');
+    var vs0 = app.videoSync();
+    if (vs0.manual) {
+      a.status = 'не нужна: поправка выставлена вручную';
+      a.evals = (a.evals || 0) + 1;
+      return;
+    }
+
+    var c = app.composed(track.os_id);
+    var cues = app.parseCues(app.texts[track.os_id]);
+    var vs = app.videoSync();
+    // после расчёта по длительности остаётся только заставка площадки и разница релизов — ищем рядом
+    // широкий поиск (±90 с) — только пока субтитры скрыты и ждут проверки; при показе звук лишь доводит время
+    var dmax = s0 && s0.waiting && !vs.anchors.length && vs.src !== 'duration' ? 90 : 15;
+    var res = audioEstimator.evaluate({
+      samples: a.samples,
+      cues: cues.map(function (q) { return { start: q.start * c.scale + c.offset, end: q.end * c.scale + c.offset }; }),
+      dmaxSec: dmax
+    });
+    if (!res) return;
+    var shift = res.shift, z1 = res.z1, z2 = res.z2;
+    app.log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1), res.strong ? 'сильное' : '');
+    a.evals = (a.evals || 0) + 1;
+    var need = res.need;
+    // одинаковый сдвиг в двух проверках подряд — тоже уверенность, даже если каждая чуть ниже порога
+    var prevE = a.lastShift;
+    a.lastShift = { d: shift, z: z1 };
+    var agree = prevE && Math.abs(prevE.d - shift) <= 0.3 && prevE.z >= need - 0.5 && z1 >= need - 0.5 && z2 <= z1 * 0.7;
+    if (res.edge || (!agree && !res.confident)) {
+      a.status = 'слушает ' + Math.round(res.tEnd - res.tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
+      // полное окно прослушано, а уверенности нет — не показываем вслепую (Decider), предлагаем калибровку
+      if (s0 && s0.waiting && res.tEnd - res.tStart >= app.AUDIO_TARGET) app.finishBackground('нет уверенности');
+      return;
+    }
+    a.status = 'последняя проверка: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с (уверенность ' + z1.toFixed(1) + ')';
+
+    var center = (res.tStart + res.tEnd) / 2;
+    var o = (center - vs.offset) / vs.scale;
+    // сильное совпадение подтверждает само (правило 7); слабее — вместе с кандидатом вставки или повтором
+    app.addAnchor(o, center + shift, 'audio', res.strong || agree ? 0.85 : 0.6);
+    app.finishBackground('ok');
+    if (!a.told && Math.abs(shift) >= 1) {
+      a.told = true;
+      app.notify('Субтитры подстроены по звуку: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с');
+    }
+    app.engineEvents.emit('progress', { value: 1 });
+  };
+
+  app.audioProgress = function audioProgress() {
+    if (!app.audio || !app.audio.samples.length) return 0;
+    var seg = app.audio.samples[app.audio.samples.length - 1].s;
+    var first = null, last = 0;
+    for (var i = app.audio.samples.length - 1; i >= 0 && app.audio.samples[i].s === seg; i--) first = app.audio.samples[i].t;
+    last = app.audio.samples[app.audio.samples.length - 1].t;
+    return first === null ? 0 : Math.min(0.97, (last - first) / app.AUDIO_TARGET);
+  };
+};
+  },
+
   "analyzers/subtitle": function (module, exports, require) {
 /*
  * Разбор субтитров (WebVTT/SRT) и пересчёт их таймингов. Время — мс (ADR 6).
@@ -136,7 +318,10 @@ module.exports = { getText: getText, getJSON: getJSON };
  *   cache: { get(key) → { durationMs } | null, set(key, { durationMs }) } — длительности переживают перезапуск.
  *
  * ctx (описание текущего видео):
- *   { url: data.url плеера, card: карточка Lampa, episode: { season, episode } | null, balancer: 'phantom' | '' }
+ *   { url: data.url плеера, card: карточка Lampa, episode: { season, episode } | null, balancer: 'phantom' | '',
+ *     voice: озвучка текущего видео }
+ * originals(ctx, done)      — длительности дорожки «Оригинал» у текущего источника и Phantom/Aladin/ZetflixDB;
+ * siblings(ctx, max, done)  — длительности других озвучек этой серии у текущего источника.
  */
 'use strict';
 
@@ -226,39 +411,19 @@ function create(deps) {
     } else done(pickQ(item));
   }
 
-  // done(durationMs | null, why)
-  function originalDurationMs(ctx, bal, done) {
+  function norm(name) {
+    return String(name || '').toLowerCase().replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+  }
+
+  // Список озвучек/серий источника для текущего видео: done(json, env) | done(null, why).
+  // json.type — 'movie' (data: озвучки) или 'episode' (voice: озвучки, data: серии активной озвучки).
+  function listing(ctx, bal, done) {
     var inf = info(ctx.url, ctx.balancer);
     if (!inf) return done(null, 'источник не Lampac');
     bal = bal || inf.bal;
     var ep = ctx.episode;
     var card = ctx.card || {};
-    var key = bal + '|' + card.id + (ep ? '|' + ep.season + 'x' + ep.episode : '');
-    var hit = cache.get(key);
-    if (hit && hit.durationMs) return done(hit.durationMs);
-    var fix = function (u) { return fixHost(u, inf.host); };
-
-    var finish = function (item, why) {
-      if (!item) return done(null, why || 'у источника нет оригинальной дорожки');
-      playableUrl({ method: item.method, url: fix(item.url), quality: item.quality }, function (u) {
-        u = fix(u);
-        if (!/m3u8/i.test(u)) return done(null, 'не HLS');
-        hls.durationMs(http, u, function (r) {
-          cache.set(key, { durationMs: r.durationMs });
-          done(r.durationMs);
-        }, function (e) { done(null, 'плейлист: ' + e); });
-      }, function (e) { done(null, 'ссылка: ' + e); });
-    };
-
-    var episodesOf = function (json, cb) {
-      var voice = json.voice && pickOriginal(json.voice, function (v) { return v.name; });
-      if (!voice) {
-        return cb(null, 'в списке озвучек нет оригинала (' +
-          (json.voice || []).map(function (v) { return v.name; }).join(', ').slice(0, 80) + ')');
-      }
-      if (voice.active) return cb(json);
-      http.getJSON(withAcc(fix(voice.url), inf.acc), cb, function (e) { cb(null, 'не открылась озвучка «' + voice.name + '»: ' + e); });
-    };
+    var env = { inf: inf, bal: bal, ep: ep, fix: function (u) { return fixHost(u, inf.host); } };
 
     var handle = function (json, depth) {
       // источник сначала отдаёт список сезонов — переходим в нужный
@@ -266,25 +431,13 @@ function create(deps) {
         var seasons = json.data || [];
         for (var si = 0; si < seasons.length; si++) {
           if (seasonNumber(seasons[si]) === ep.season && seasons[si].url) {
-            return http.getJSON(withAcc(fix(seasons[si].url), inf.acc), function (j) { handle(j, depth + 1); },
+            return http.getJSON(withAcc(env.fix(seasons[si].url), inf.acc), function (j) { handle(j, depth + 1); },
               function (e) { done(null, 'сезон не открылся: ' + e); });
           }
         }
         return done(null, 'у источника нет сезона ' + ep.season);
       }
-      if (json.type === 'movie') {
-        return finish(pickOriginal(json.data || [], function (x) { return x.translate || x.details || x.title; }),
-          'в списке озвучек нет оригинала (' +
-          (json.data || []).map(function (x) { return x.translate || x.details || ''; }).join(', ').slice(0, 80) + ')');
-      }
-      if (json.type === 'episode' && ep) {
-        return episodesOf(json, function (list, why) {
-          if (!list) return finish(null, why);
-          var items = list.data || [];
-          for (var i = 0; i < items.length; i++) if (parseInt(items[i].e, 10) === ep.episode) return finish(items[i]);
-          finish(null, 'в оригинале нет серии ' + ep.episode);
-        });
-      }
+      if (json.type === 'movie' || (json.type === 'episode' && ep)) return done(json, env);
       if (json.type === 'episode' && !json.voice) return done(null, 'у источника «' + bal + '» одна озвучка, оригинала нет');
       done(null, 'источник «' + bal + '» ответил «' + json.type + '»' + (ep ? '' : ' (серия не определена)'));
     };
@@ -294,8 +447,8 @@ function create(deps) {
         function (e) { done(null, 'источник «' + bal + '» не ответил: ' + e); });
     };
 
-    if (card.kinopoisk_id || card.imdb_id) return request(card);
-    // id других баз — как это делает онлайн-плагин Lampac
+    if (card.kinopoisk_id && card.imdb_id) return request(card);
+    // id других баз — как это делает онлайн-плагин Lampac (ZetflixDB без kinopoisk_id отвечает 503)
     http.getJSON(withAcc(inf.host + '/externalids?id=' + encodeURIComponent(card.id) + '&serial=' + (card.name ? 1 : 0), inf.acc),
       function (ids) {
         var c = {};
@@ -305,6 +458,121 @@ function create(deps) {
         request(c);
       }, function () { request(card); });
   }
+
+  // длительность одного пункта (озвучка фильма или серия): done(ms | null, why)
+  function itemDurationMs(env, item, key, done) {
+    if (!item) return done(null, 'нет ссылки');
+    var hit = key && cache.get(key);
+    if (hit && hit.durationMs) return done(hit.durationMs);
+    playableUrl({ method: item.method, url: env.fix(item.url), quality: item.quality }, function (u) {
+      u = env.fix(u);
+      if (!/m3u8/i.test(u)) return done(null, 'не HLS');
+      hls.durationMs(http, u, function (r) {
+        if (key) cache.set(key, { durationMs: r.durationMs });
+        done(r.durationMs);
+      }, function (e) { done(null, 'плейлист: ' + e); });
+    }, function (e) { done(null, 'ссылка: ' + e); });
+  }
+
+  // серии озвучки voice: done(list | null, why)
+  function voiceEpisodes(env, json, voice, done) {
+    if (voice.active) return done(json);
+    http.getJSON(withAcc(env.fix(voice.url), env.inf.acc), done, function (e) { done(null, 'не открылась озвучка «' + voice.name + '»: ' + e); });
+  }
+
+  function episodeItem(list, ep) {
+    var items = (list && list.data) || [];
+    for (var i = 0; i < items.length; i++) if (parseInt(items[i].e, 10) === ep.episode) return items[i];
+    return null;
+  }
+
+  function cacheKey(env, card, extra) {
+    return env.bal + '|' + card.id + (env.ep ? '|' + env.ep.season + 'x' + env.ep.episode : '') + (extra ? '|' + extra : '');
+  }
+
+  // done(durationMs | null, why)
+  function originalDurationMs(ctx, bal, done) {
+    var inf = info(ctx.url, ctx.balancer);
+    if (!inf) return done(null, 'источник не Lampac');
+    var card = ctx.card || {};
+    var ep = ctx.episode;
+    var key = (bal || inf.bal) + '|' + card.id + (ep ? '|' + ep.season + 'x' + ep.episode : '');
+    var hit = cache.get(key);
+    if (hit && hit.durationMs) return done(hit.durationMs);
+    listing(ctx, bal, function (json, env) {
+      if (!json) return done(null, env);
+      if (json.type === 'movie') {
+        var it = pickOriginal(json.data || [], function (x) { return x.translate || x.details || x.title; });
+        if (!it) {
+          return done(null, 'в списке озвучек нет оригинала (' +
+            (json.data || []).map(function (x) { return x.translate || x.details || ''; }).join(', ').slice(0, 80) + ')');
+        }
+        return itemDurationMs(env, it, key, done);
+      }
+      var voice = json.voice && pickOriginal(json.voice, function (v) { return v.name; });
+      if (!voice) {
+        return done(null, 'в списке озвучек нет оригинала (' +
+          (json.voice || []).map(function (v) { return v.name; }).join(', ').slice(0, 80) + ')');
+      }
+      voiceEpisodes(env, json, voice, function (list, why) {
+        if (!list) return done(null, why);
+        var item = episodeItem(list, env.ep);
+        if (!item) return done(null, 'в оригинале нет серии ' + env.ep.episode);
+        itemDurationMs(env, item, key, done);
+      });
+    });
+  }
+
+  // Другие озвучки той же серии у текущего источника (без оригинала и текущей): их длительности —
+  // второе свидетельство «та же сборка» для правила 2. done([{ voice, durationMs }])
+  function siblings(ctx, max, done) {
+    max = max || 3;
+    var current = norm(ctx.voice);
+    listing(ctx, null, function (json, env) {
+      if (!json) return done([], [env]);
+      var card = ctx.card || {};
+      var isOrig = function (n) { return !!pickOriginal([n], function (x) { return x; }); };
+      var picks = [];
+      var i;
+      if (json.type === 'movie') {
+        var data = json.data || [];
+        for (i = 0; i < data.length && picks.length < max; i++) {
+          var n = data[i].translate || data[i].details || data[i].title || '';
+          if (!isOrig(n) && norm(n) !== current && current.indexOf(norm(n)) < 0) picks.push({ name: n, item: data[i] });
+        }
+      } else {
+        var voices = json.voice || [];
+        for (i = 0; i < voices.length && picks.length < max; i++) {
+          var vn = voices[i].name || '';
+          if (!isOrig(vn) && norm(vn) !== current && current.indexOf(norm(vn)) < 0) picks.push({ name: vn, voice: voices[i] });
+        }
+      }
+      if (!picks.length) return done([], ['других озвучек нет']);
+      var out = [];
+      var reasons = [];
+      // по одной: на параллельные запросы Phantom отвечает 503 (проверено на живом Lampac)
+      var next = function (k) {
+        if (k >= picks.length) return done(out, reasons);
+        var p = picks[k];
+        var key = cacheKey(env, card, 'v:' + norm(p.name));
+        var got = function (ms, why) {
+          if (ms) out.push({ voice: p.name, durationMs: ms });
+          else reasons.push(p.name + ': ' + why);
+          next(k + 1);
+        };
+        if (p.item) return itemDurationMs(env, p.item, key, got);
+        var hit = cache.get(key);
+        if (hit && hit.durationMs) return got(hit.durationMs);
+        voiceEpisodes(env, json, p.voice, function (list, why) {
+          var item = list && episodeItem(list, env.ep);
+          if (!item) return got(null, list ? 'нет серии' : why);
+          itemDurationMs(env, item, key, got);
+        });
+      };
+      next(0);
+    });
+  }
+
 
   // done([{ source, durationMs, own }], reasons) — текущий источник и ORIG_SOURCES, параллельно.
   function originals(ctx, done) {
@@ -330,7 +598,8 @@ function create(deps) {
   return {
     info: function (ctx) { return info(ctx.url, ctx.balancer); },
     originalDurationMs: originalDurationMs,
-    originals: originals
+    originals: originals,
+    siblings: siblings
   };
 }
 
@@ -341,6 +610,549 @@ module.exports = {
   fixHost: fixHost,
   liteUrl: liteUrl,
   create: create
+};
+  },
+
+  "api/opensubtitles": function (module, exports, require) {
+/*
+ * SubtitleProvider: поиск и скачивание OpenSubtitles, кеш файлов в IndexedDB, ранжирование релизов.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+var reference = require('../engine/reference');
+
+module.exports = function (app) {
+  app.API = 'https://api.opensubtitles.com/api/v1';
+
+  app.UA = 'LampaOpenSubs v1.0';
+
+
+  // ---------- сеть ----------
+  app.xhr = function xhr(method, url, body, done, fail) {
+    var r = new XMLHttpRequest();
+    r.open(method, url, true);
+    r.timeout = 15000;
+    r.setRequestHeader('Api-Key', app.apiKey());
+    r.setRequestHeader('X-User-Agent', app.UA);
+    r.setRequestHeader('Accept', 'application/json');
+    if (body) r.setRequestHeader('Content-Type', 'application/json');
+    r.onload = function () {
+      var json = null;
+      try { json = JSON.parse(r.responseText); } catch (e) {}
+      if (r.status >= 200 && r.status < 300 && json) done(json);
+      else fail(r.status, json);
+    };
+    r.onerror = function () { fail(0); };
+    r.ontimeout = function () { fail(0); };
+    r.send(body ? JSON.stringify(body) : null);
+  };
+
+
+  // API OpenSubtitles требует параметры в алфавитном порядке и в нижнем регистре,
+  // иначе отвечает редиректом, который ломает CORS в браузере
+  app.query = function query(params) {
+    var keys = Object.keys(params).sort();
+    var out = [];
+    for (var i = 0; i < keys.length; i++) {
+      var v = params[keys[i]];
+      if (v === null || typeof v === 'undefined' || v === '') continue;
+      out.push(keys[i] + '=' + encodeURIComponent(String(v).toLowerCase()).replace(/%2C/g, ','));
+    }
+    return out.join('&');
+  };
+
+
+  // ---------- хранилище субтитров (IndexedDB на устройстве) ----------
+  // Скачанный файл хранится по file_id: повторный просмотр не тратит дневной лимит OpenSubtitles.
+  app.DB_NAME = 'opensubs';
+
+  app.STORE = 'files';
+
+  app.DB_MAX = 300;
+
+  app.dbPromise = null;
+
+  app.blobUrls = [];
+
+  app.db = function db(cb) {
+    if (app.dbPromise === false) return cb(null);
+    if (app.dbPromise) return app.dbPromise.push(cb);
+    app.dbPromise = [cb];
+    var flush = function (d) {
+      var list = app.dbPromise;
+      app.dbPromise = d ? { push: function (f) { f(d); } } : false;
+      for (var i = 0; i < list.length; i++) list[i](d);
+    };
+    try {
+      var req = window.indexedDB.open(app.DB_NAME, 1);
+      req.onupgradeneeded = function () {
+        var s = req.result.createObjectStore(app.STORE, { keyPath: 'id' });
+        s.createIndex('t', 't');
+      };
+      req.onsuccess = function () { flush(req.result); };
+      req.onerror = req.onblocked = function () { flush(null); };
+    } catch (e) {
+      flush(null);
+    }
+  };
+
+  app.storeGet = function storeGet(id, cb) {
+    app.db(function (d) {
+      if (!d) return cb(null);
+      try {
+        var r = d.transaction(app.STORE, 'readonly').objectStore(app.STORE).get(id);
+        r.onsuccess = function () { cb(r.result ? r.result.text : null); };
+        r.onerror = function () { cb(null); };
+      } catch (e) { cb(null); }
+    });
+  };
+
+  app.storePut = function storePut(id, text) {
+    app.db(function (d) {
+      if (!d) return;
+      try {
+        var s = d.transaction(app.STORE, 'readwrite').objectStore(app.STORE);
+        s.put({ id: id, text: text, t: Date.now() });
+        var c = s.count();
+        c.onsuccess = function () {
+          var extra = c.result - app.DB_MAX;
+          if (extra <= 0) return;
+          s.index('t').openCursor().onsuccess = function (e) {
+            var cur = e.target.result;
+            if (cur && extra-- > 0) {
+              cur.delete();
+              cur['continue']();
+            }
+          };
+        };
+      } catch (e) {}
+    });
+  };
+
+  app.storeStats = function storeStats(cb) {
+    app.db(function (d) {
+      if (!d) return cb(-1);
+      try {
+        var c = d.transaction(app.STORE, 'readonly').objectStore(app.STORE).count();
+        c.onsuccess = function () { cb(c.result); };
+        c.onerror = function () { cb(-1); };
+      } catch (e) { cb(-1); }
+    });
+  };
+
+  app.storeClear = function storeClear(cb) {
+    app.db(function (d) {
+      if (!d) return cb && cb();
+      try {
+        var r = d.transaction(app.STORE, 'readwrite').objectStore(app.STORE).clear();
+        r.onsuccess = r.onerror = function () { cb && cb(); };
+      } catch (e) { cb && cb(); }
+    });
+  };
+
+  app.textUrl = function textUrl(text) {
+    try {
+      var u = URL.createObjectURL(new Blob([text], { type: 'text/vtt' }));
+      app.blobUrls.push(u);
+      return u;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  app.revokeUrls = function revokeUrls() {
+    for (var i = 0; i < app.blobUrls.length; i++) try { URL.revokeObjectURL(app.blobUrls[i]); } catch (e) {}
+    app.blobUrls = [];
+  };
+
+  app.fetchText = function fetchText(url, done, fail) {
+    var r = new XMLHttpRequest();
+    r.open('GET', url, true);
+    r.timeout = 20000;
+    r.onload = function () {
+      if (r.status >= 200 && r.status < 300 && /-->/.test(r.responseText)) done(r.responseText);
+      else fail(r.status);
+    };
+    r.onerror = r.ontimeout = function () { fail(0); };
+    r.send(null);
+  };
+
+
+  // done(text, link): текст файла (из хранилища или свежескачанный); link — прямая ссылка, если текст получить не удалось
+  app.download = function download(fileId, done, fail) {
+    app.storeGet(fileId, function (text) {
+      if (text) return done(text, null);
+
+      app.xhr('POST', app.API + '/download', { file_id: fileId, sub_format: 'webvtt' }, function (json) {
+        if (!json.link) return fail(json);
+        app.fetchText(json.link, function (body) {
+          app.storePut(fileId, body);
+          done(body, null);
+        }, function () {
+          done(null, json.link);
+        });
+      }, function (status, json) {
+        fail(json || status);
+      });
+    });
+  };
+
+  app.buildQuery = function buildQuery(card, data, langs) {
+    var p = { languages: langs.slice().sort().join(','), order_by: 'download_count' };
+    var isTv = !!(card.name || card.original_name || card.number_of_seasons || data.season);
+    var tmdbOk = card.id && (!card.source || card.source === 'tmdb' || card.source === 'cub');
+    var imdb = parseInt(String(card.imdb_id || '').replace(/^tt/, ''), 10) || ''; // без ведущих нулей, иначе редирект
+
+    if (isTv) {
+      var ep = app.episodeInfo(data);
+      if (!ep) return null; // без номера серии подберутся субтитры от другой серии
+      p.season_number = ep.season;
+      p.episode_number = ep.episode;
+      if (tmdbOk) p.parent_tmdb_id = card.id;
+      else if (imdb) p.parent_imdb_id = imdb;
+      else p.query = card.original_name || card.name;
+    } else {
+      if (imdb) p.imdb_id = imdb;
+      else if (tmdbOk) p.tmdb_id = card.id;
+      else {
+        p.query = card.original_title || card.title;
+        var y = String(card.release_date || '').slice(0, 4);
+        if (y) p.year = y;
+      }
+    }
+    return p;
+  };
+
+
+  // Экранки и ранние релизы: свой хронометраж, с онлайн-видео не совпадают
+  // ранжирование релизов — engine/reference.js (ReferenceSelector)
+  app.score = function score(a) {
+    return reference.score(a, { fps: app.session && app.session.vidFps });
+  };
+
+  // лучшие варианты по языкам: {lang: [attrs…]}
+  app.groupFound = function groupFound(list, langs) {
+    var groups = {};
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i].attributes;
+      if (!a || !a.files || !a.files.length) continue;
+      if (a.machine_translated || a.ai_translated) continue;
+      var l = app.normLang(a.language);
+      if (langs.indexOf(l) < 0) continue;
+      a._score = app.score(a);
+      a._lang = l;
+      (groups[l] = groups[l] || []).push(a);
+    }
+    for (var k in groups) groups[k] = groups[k].sort(function (x, y) { return y._score - x._score; }).slice(0, 3);
+    return groups;
+  };
+
+  app.shortRelease = function shortRelease(a) {
+    var r = String(a.release || '').replace(/[._]/g, ' ').replace(/\s+/g, ' ').trim();
+    return r.length > 40 ? r.slice(0, 40) + '…' : r;
+  };
+
+  app.trackLabel = function trackLabel(a) {
+    return app.langName(a._lang) + ' · OS · ' + app.shortRelease(a);
+  };
+};
+  },
+
+  "app/boot": function (module, exports, require) {
+/*
+ * Настройки плагина в Lampa и запуск: подписки на плеер, перенос профилей.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+module.exports = function (app) {
+  // ---------- настройки ----------
+  app.settings = function settings() {
+    if (!Lampa.SettingsApi) return;
+
+    Lampa.SettingsApi.addComponent({
+      component: 'opensubs',
+      name: 'OpenSubtitles',
+      icon: app.ICON
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_enabled', type: 'trigger', default: true },
+      field: { name: 'Искать субтитры', description: 'При запуске видео. Включаются кнопкой CC в плеере' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: {
+        name: 'opensubs_lang',
+        type: 'select',
+        values: { audio: 'Как у озвучки', ru: 'Русские', uk: 'Українські', en: 'English' },
+        default: 'audio'
+      },
+      field: { name: 'Язык субтитров', description: '«Как у озвучки» — по выбранной дорожке: (EN) Оригинал → английские, DUB → русские' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: {
+        name: 'opensubs_langs',
+        type: 'select',
+        values: {
+          'ru,uk,en': 'Русские, украинские, английские',
+          'ru,en': 'Русские, английские',
+          'uk,en': 'Украинские, английские',
+          'uk,ru,en': 'Украинские, русские, английские',
+          'en,ru': 'Английские, русские',
+          'en': 'Только английские'
+        },
+        default: 'ru,uk,en'
+      },
+      field: { name: 'Запасные языки', description: 'Если на языке озвучки субтитров нет' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_durationsync', type: 'trigger', default: true },
+      field: { name: 'Заставки озвучек по длительности', description: 'Сравнивать длительность серии в озвучке с дорожкой «Оригинальный» того же источника и сдвигать субтитры на разницу' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_audiosync', type: 'trigger', default: true },
+      field: { name: 'Подстройка по звуку', description: 'Слушать речь в видео и сдвигать субтитры: заставки студий (LostFilm, HDRezka), разная частота кадров' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_autosync', type: 'trigger', default: true },
+      field: { name: 'Автосинхронизация', description: 'Выравнивать русские и украинские субтитры по английским (ещё одно скачивание на фильм)' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_notify', type: 'trigger', default: true },
+      field: { name: 'Уведомления', description: 'Сообщать об отсутствующем API-ключе и других проблемах' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_apikey', type: 'input', values: '', placeholder: 'ключ с opensubtitles.com', default: '' },
+      field: { name: 'API-ключ', description: 'Обязательно. opensubtitles.com → Профиль → API consumers' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_ffprobe', type: 'input', values: '', placeholder: 'не используется', default: '' },
+      field: { name: 'Служба ffprobe (необязательно)', description: 'Адрес службы, которая отвечает JSON ffprobe на ?url=… Без неё всё считается в браузере' }
+    });
+
+    Lampa.SettingsApi.addParam({
+      component: 'opensubs',
+      param: { name: 'opensubs_clear', type: 'button' },
+      field: { name: 'Очистить сохранённые субтитры', description: 'Скачанные файлы хранятся на этом устройстве' },
+      onRender: function (item) {
+        app.storeStats(function (n) {
+          var d = item.find('.settings-param__descr');
+          if (n >= 0) d.text('Сохранено на этом устройстве: ' + n + ' (до ' + app.DB_MAX + ', старые удаляются сами)');
+          else d.text('Хранилище недоступно на этом устройстве');
+        });
+      },
+      onChange: function () {
+        app.storeClear(function () {
+          Lampa.Noty.show('OpenSubtitles: сохранённые субтитры удалены');
+          Lampa.Settings.update();
+        });
+      }
+    });
+  };
+
+  app.start = function start() {
+    app.settings();
+    app.css();
+    app.applyStyle();
+    app.addButton();
+    app.hookPlayerSettings();
+    try {
+      Lampa.PlayerVideo.listener.follow('subs', function () { setTimeout(app.reassert, 0); });
+    } catch (e) {}
+    var timer = null;
+    Lampa.Player.listener.follow('start', function (data) {
+      app.addButton();
+      app.applyStyle();
+      clearInterval(timer);
+      timer = setInterval(function () { app.updateButtons(); app.checkSecondPrompt(); }, 1000);
+      app.audioStop();
+      app.current = null;
+      app.revokeUrls(); // файлы прошлого видео больше не нужны
+      try { app.load(data || {}); } catch (e) { app.log('error', e); }
+    });
+    Lampa.Player.listener.follow('destroy', function () {
+      app.current = null;
+      clearInterval(timer); // сеанс не сбрасываем: Lampa шлёт destroy и при переключении серий
+      app.audioStop();
+    });
+    try { localStorage.removeItem('opensubs_links'); } catch (e) {} // кеш ссылок из первой версии
+    try { if (app.profiles.migrate()) app.log('профили перенесены из прежних ключей'); } catch (e) { app.log('перенос профилей:', e); }
+  };
+
+  app.boot = function () {
+    if (window.appready) app.start();
+    else {
+      Lampa.Listener.follow('app', function (e) {
+        if (e.type === 'ready') app.start();
+      });
+    }
+  };
+};
+  },
+
+  "app/services": function (module, exports, require) {
+/*
+ * Общие экземпляры: LampacAdapter, ClientProbe, события движка, ProfileStore.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+var http = require('../api/http');
+
+module.exports = function (app) {
+  app.lampacApi = require('../api/lampac').create({ http: http, cache: {
+    get: function (k) { return app.odurGet(k); },
+    set: function (k, v) { app.odurSet(k, v); }
+  } });
+
+  app.clientProbe = require('../probe/client-probe').create({ http: http });
+
+  // характеристики видео: FFProbe, если указан адрес службы (настройка opensubs_ffprobe), иначе ClientProbe (ADR 1)
+  app.videoProbe = {
+    probe: function (req, done) {
+      var endpoint = String(Lampa.Storage.get('opensubs_ffprobe', '') || '').replace(/^\s+|\s+$/g, '');
+      require('../probe/ffprobe').create({ http: http, endpoint: endpoint, fallback: app.clientProbe }).probe(req, done);
+    }
+  };
+
+  app.engineEvents = require('../engine/events').create();
+
+  // профили (profiles/storage.js): субтитры и видео раздельно, уровни доверия по длительности видео (ADR 4)
+  app.profiles = require('../profiles/storage').create({
+    read: function (name) {
+      var v = Lampa.Storage.get(name, '');
+      if (typeof v === 'string' && v) try { v = JSON.parse(v); } catch (e) { v = null; }
+      return v === '' ? null : v;
+    },
+    write: function (name, v) { Lampa.Storage.set(name, v); }
+  });
+};
+  },
+
+  "app/util": function (module, exports, require) {
+/*
+ * Общие мелочи: журнал, настройки, хранилище Lampa, карточка и серия, язык.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+var subtitle = require('../analyzers/subtitle');
+var time = require('../engine/time');
+
+module.exports = function (app) {
+  app.LANG_NAMES = { ru: 'Русские', uk: 'Українські', en: 'English' };
+
+  app.log = function log() {
+    try {
+      var args = Array.prototype.slice.call(arguments);
+      args.unshift('OpenSubs');
+      console.log.apply(console, args);
+    } catch (e) {}
+  };
+
+  app.setting = function setting(name, def) {
+    var v = Lampa.Storage.get('opensubs_' + name, def);
+    return v === '' || v === null || typeof v === 'undefined' ? def : v;
+  };
+
+  app.flag = function flag(name, def) {
+    var v = app.setting(name, def);
+    return v === true || v === 'true';
+  };
+
+  app.apiKey = function apiKey() {
+    return String(app.setting('apikey', '') || '').trim();
+  };
+
+
+  // ---------- что смотрим ----------
+  app.activeCard = function activeCard() {
+    try {
+      var a = Lampa.Activity.active();
+      if (!a) return null;
+      return a.movie || a.card || (a.object && (a.object.movie || a.object.card)) || null;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  app.episodeInfo = function episodeInfo(data) {
+    var s = parseInt(data.season, 10);
+    var e = parseInt(data.episode, 10);
+    if (!(s > 0 && e > 0)) {
+      var m = String(data.title || '').match(/s(\d{1,2})\s*e(\d{1,3})/i);
+      if (m) {
+        s = parseInt(m[1], 10);
+        e = parseInt(m[2], 10);
+      }
+    }
+    return s > 0 && e > 0 ? { season: s, episode: e } : null;
+  };
+
+  app.langName = function langName(code) {
+    return app.LANG_NAMES[code] || String(code || '').toUpperCase();
+  };
+
+  app.normLang = function normLang(code) {
+    code = String(code || '').toLowerCase();
+    if (code === 'ua') return 'uk';
+    return code.split('-')[0];
+  };
+
+  app.notify = function notify(text) {
+    if (app.flag('notify', true)) Lampa.Noty.show(text);
+  };
+
+  app.store = function store(name) {
+    var c = Lampa.Storage.get(name, '{}');
+    if (typeof c === 'string') try { c = JSON.parse(c); } catch (e) { c = {}; }
+    return c && typeof c === 'object' ? c : {};
+  };
+
+  app.storeSave = function storeSave(name, all, max) {
+    var keys = Object.keys(all);
+    if (keys.length > max) {
+      keys.sort(function (a, b) { return (all[a].t || 0) - (all[b].t || 0); });
+      for (var i = 0; i < keys.length - max; i++) delete all[keys[i]];
+    }
+    Lampa.Storage.set(name, all);
+  };
+
+  app.round3 = function round3(x) { return Math.round(x * 1000) / 1000; };
+
+
+  // Разбор и пересчёт таймингов — analyzers/subtitle.js (мс); здесь — переходники на секунды прототипа.
+  app.fmtTime = function fmtTime(t) {
+    return time.formatClock(t * 1000);
+  };
+
+
+  // реплики файла: [{start, end, text}] в секундах
+  app.parseCues = function parseCues(text) {
+    return subtitle.parse(text).map(function (c) { return { start: c.startMs / 1000, end: c.endMs / 1000, text: c.text }; });
+  };
+
+  app.isMovie = function isMovie(s) {
+    return !app.episodeInfo(s.data) && !(s.card && (s.card.name || s.card.original_name));
+  };
 };
   },
 
@@ -622,6 +1434,123 @@ function create() {
 module.exports = { create: create };
   },
 
+  "engine/reference": function (module, exports, require) {
+/*
+ * ReferenceSelector — какие субтитры брать и с чем их сверять.
+ *   score(attrs)                 — ранг файла OpenSubtitles: экранки вниз, BluRay/WEB вверх, релизы площадок
+ *                                  (NF, AMZN, HMAX…) выше всего (их хронометраж совпадает с видео источников);
+ *   pick(list, { fps })          — лучший файл с учётом частоты кадров видео;
+ *   reference(enList, target)    — эталон для crossSubs: английские того же релиза, что и показываемые,
+ *                                  иначе той же площадки, иначе лучшие по рангу;
+ *   timeline(cues, videoMs)      — для фильма без оригинала: укладываются ли реплики в длительность видео
+ *                                  (слабая гипотеза, без подтверждения — ADR правило 4).
+ */
+'use strict';
+
+var types = require('./types');
+
+var BAD_RELEASE = /(^|[^a-z])(cam|hdcam|camrip|ts|hdts|telesync|tc|hdtc|telecine|scr|screener|dvdscr|bdscr|workprint|r5)([^a-z]|$)/i;
+var GOOD_RELEASE = /blu-?ray|bdrip|brrip|bdremux|remux|web-?dl|webrip|web|amzn|nf|dsnp|hmax|atvp|itunes|hdrip|dvdrip/i;
+// релизы площадок — с их отбивками; видео онлайн-источников обычно оттуда же
+var PLATFORM_RELEASE = /(^|[^a-z])(nf|amzn|atvp|dsnp|hmax|hulu|pcok|pmtp|stan|crav|itunes)([^a-z]|$)/i;
+var PLATFORMS = ['nf', 'amzn', 'atvp', 'dsnp', 'hmax', 'hulu', 'pcok', 'pmtp', 'stan', 'crav', 'itunes'];
+var NOISE = /^(\d{3,4}p|x26[45]|h26[45]|hevc|avc|aac\d*|ac3|dd\d*|ddp\d*|atmos|10bit|hdr|sdr|proper|repack|rerip|internal|mkv|mp4|srt|eng|en|rus|ru)$/i;
+
+function releaseText(a) {
+  return String(a.release || '') + ' ' + String((a.files && a.files[0] && a.files[0].file_name) || '');
+}
+
+function fpsFamily(f) {
+  f = parseFloat(f) || 0;
+  if (!f) return null;
+  if (Math.abs(f - 25) < 0.1) return 'pal';
+  if (Math.abs(f - 23.976) < 0.1 || Math.abs(f - 24) < 0.1) return 'film';
+  return 'other';
+}
+
+function score(a, opts) {
+  opts = opts || {};
+  var rel = releaseText(a);
+  var sc = Math.log(1 + (a.download_count || 0)); // 0…~14
+  if (BAD_RELEASE.test(rel)) sc -= 100;
+  if (GOOD_RELEASE.test(rel)) sc += 6;
+  if (PLATFORM_RELEASE.test(rel)) sc += 8;
+  if (a.from_trusted) sc += 3;
+  var fam = fpsFamily(a.fps);
+  var vid = fpsFamily(opts.fps);
+  if (vid && fam) sc += fam === vid ? 2 : -4;          // частота кадров видео известна
+  else if (fam && fam !== 'film') sc -= 4;            // 25/29.97/30 — чаще всего не наш хронометраж
+  if (a.hearing_impaired) sc -= 2;
+  return sc;
+}
+
+function pick(list, opts) {
+  var best = null, bestScore = -Infinity;
+  for (var i = 0; i < (list || []).length; i++) {
+    var s = score(list[i], opts);
+    if (s > bestScore) { best = list[i]; bestScore = s; }
+  }
+  return best;
+}
+
+function tokens(a) {
+  var out = {};
+  releaseText(a).toLowerCase().replace(/\.(srt|vtt|sub|ass)\b/g, ' ').split(/[^a-z0-9]+/).forEach(function (t) {
+    if (t && t.length > 1 && !NOISE.test(t) && !/^s\d\de\d\d$/.test(t) && !/^(19|20)\d\d$/.test(t)) out[t] = true;
+  });
+  return out;
+}
+
+function platformOf(a) {
+  var t = tokens(a);
+  for (var i = 0; i < PLATFORMS.length; i++) if (t[PLATFORMS[i]]) return PLATFORMS[i];
+  return null;
+}
+
+function similarity(a, b) {
+  var x = tokens(a), y = tokens(b), inter = 0, uni = 0, k;
+  for (k in x) { uni++; if (y[k]) inter++; }
+  for (k in y) if (!x[k]) uni++;
+  return uni ? inter / uni : 0;
+}
+
+// target — атрибуты показываемых субтитров (или null)
+function reference(enList, target, opts) {
+  if (!enList || !enList.length) return null;
+  if (!target) return pick(enList, opts);
+  var plat = platformOf(target);
+  var best = null, bestScore = -Infinity;
+  for (var i = 0; i < enList.length; i++) {
+    var e = enList[i];
+    var s = similarity(e, target) * 20 + (plat && platformOf(e) === plat ? 6 : 0) + score(e, opts) / 4;
+    if (s > bestScore) { best = e; bestScore = s; }
+  }
+  return best;
+}
+
+// Фильм без оригинала: последняя реплика заканчивается до конца видео, но не раньше чем за 15% (титры).
+function timeline(cues, videoMs) {
+  if (!cues || !cues.length || !videoMs) return null;
+  var last = 0;
+  for (var i = 0; i < cues.length; i++) last = Math.max(last, cues[i].endMs);
+  var ratio = last / videoMs;
+  if (last > videoMs + 5000 || ratio < 0.85) return null;
+  return types.hypothesis({
+    estimator: 'timeline',
+    kind: 'offset',
+    offsetMs: 0,
+    sigmaMs: 3000,
+    confidence: ratio >= 0.93 ? 0.6 : 0.4,
+    evidence: [{ what: 'последняя реплика / длительность видео', value: Math.round(ratio * 1000) / 1000, source: 'timeline' }]
+  });
+}
+
+module.exports = {
+  BAD_RELEASE: BAD_RELEASE, GOOD_RELEASE: GOOD_RELEASE, PLATFORM_RELEASE: PLATFORM_RELEASE,
+  score: score, pick: pick, reference: reference, similarity: similarity, platformOf: platformOf, timeline: timeline
+};
+  },
+
   "engine/solver": function (module, exports, require) {
 /*
  * Solver — сводит гипотезы оценщиков в одну модель «эталон → видео» (SyncModel) со статусом (ADR 2, 3, 7).
@@ -655,7 +1584,7 @@ var SPAN_MS = 300000;
 var MIN_SIGMA = 300;
 
 // Семейства независимых доказательств: длительность и кандидат вставки — одно семейство.
-var FAMILY = { duration: 'duration', openingInsertion: 'duration', fps: 'fps', crossSubs: 'crossSubs', audio: 'audio', checkpoint: 'checkpoint', profile: 'profile' };
+var FAMILY = { duration: 'duration', openingInsertion: 'duration', fps: 'fps', crossSubs: 'crossSubs', audio: 'audio', checkpoint: 'checkpoint', profile: 'profile', timeline: 'timeline' };
 
 function sigma(h) {
   return Math.max(MIN_SIGMA, h.sigmaMs);
@@ -892,6 +1821,812 @@ function solve(hyps, opts) {
 module.exports = { solve: solve, VERIFIED: VERIFIED, ESTIMATED: ESTIMATED, CONFLICT_MS: CONFLICT_MS };
   },
 
+  "engine/synchronizer": function (module, exports, require) {
+/*
+ * Synchronizer: конвейер для текущего видео — поиск, диагностика, модель, решение, профили.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+var crossSubs = require('../estimators/cross-subs');
+var decider = require('../engine/decider');
+var diagnostics = require('../engine/diagnostics');
+var fpsEstimator = require('../estimators/fps');
+var reference = require('../engine/reference');
+var solver = require('../engine/solver');
+var clientProbeLib = require('../probe/client-probe');
+var subtitle = require('../analyzers/subtitle');
+var time = require('../engine/time');
+
+module.exports = function (app) {
+  app.current = null;
+
+
+  // ---------- сеанс текущего видео ----------
+  // Поиск — при старте (бесплатно). Скачивание — только когда субтитры включены кнопкой CC,
+  // и только одного файла на нужном языке; остальные варианты скачиваются при выборе в меню.
+  app.session = null;
+
+
+  // язык озвучки: метка дорожки («(EN) Оригинал», «Украинский», «DUB | …»), иначе язык оригинала фильма
+  app.detectAudio = function detectAudio(data, card) {
+    var tr = typeof data.translate === 'string' ? data.translate : '';
+    var parts = [data.voice_name || '', tr, data.title || ''];
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i];
+      if (!t) continue;
+      if (/\((en|eng)\)|\beng\b|english|англ/i.test(t)) return 'en';
+      if (/\((uk|ua|ukr)\)|\bukr\b|україн|украин/i.test(t)) return 'uk';
+      if (/\((ru|rus)\)|\brus\b|русск/i.test(t)) return 'ru';
+      // «Субтитры», «Укр. Субтитры» у источников — оригинальная дорожка с вшитым переводом
+      if (/оригинал|оригінал|original|субтитр|субтитл/i.test(t)) return app.normLang(card.original_language) || 'en';
+      if (/\b(dub|mvo|avo|dvo)\b|дубл|многогол|двухгол|одногол|закадр|профессион|любительск/i.test(t)) return 'ru';
+      // русские студии озвучки (украинские версии помечены «Украинский» и ловятся выше)
+      if (/lostfilm|hdrezka|rezka|newstudio|tvshows|good ?people|кубик|alexfilm|jaskier|coldfilm|baibako|amedia|ideafilm|кравец|red ?head|сыендук|кураж|бомбей|novamedia|softbox|nexus|gears|anilibria|anidub|кинопоиск|пифагор|невафильм|мосфильм/i.test(t)) return 'ru';
+    }
+    return null;
+  };
+
+  app.fallbackLangs = function fallbackLangs() {
+    return String(app.setting('langs', 'ru,uk,en')).split(',');
+  };
+
+
+  // порядок языков: выбранный режим (по озвучке или фиксированный), затем запасные
+  app.langOrder = function langOrder(s) {
+    var mode = app.setting('lang', 'audio');
+    var first = mode === 'audio' ? (s && s.audio) : mode;
+    var out = [];
+    var add = function (l) { if (l && out.indexOf(l) < 0) out.push(l); };
+    add(first);
+    var fb = app.fallbackLangs();
+    for (var i = 0; i < fb.length; i++) add(fb[i]);
+    return out;
+  };
+
+  app.load = function load(data) {
+    app.session = null;
+    app.engineEvents.emit('reset', {});
+    if (!app.flag('enabled', true)) return;
+    if (data.iptv || data.youtube) return;
+
+    var card = app.activeCard();
+    if (!card) return app.log('нет карточки');
+
+    var s = app.session = { data: data, card: card, audio: app.detectAudio(data, card), found: {}, searching: false, want: undefined };
+    app.log('озвучка', s.audio);
+
+    if (!app.apiKey()) {
+      if (app.ccWanted()) app.notify('OpenSubtitles: укажите API-ключ в настройках плагина');
+      return;
+    }
+
+    var langs = app.langOrder(s);
+    if (langs.indexOf('en') < 0) langs.push('en'); // английские — эталон для автосинхронизации
+    var p = app.buildQuery(card, data, langs);
+    if (!p) return app.log('нет номера серии');
+
+    s.searching = true;
+    app.xhr('GET', app.API + '/subtitles?' + app.query(p), null, function (json) {
+      if (app.session !== s) return;
+      s.searching = false;
+      s.found = app.groupFound(json.data || [], langs);
+      if (app.ccWanted()) app.turnOn(s, true, s.userTap);
+      app.updateButtons();
+    }, function (status, json) {
+      s.searching = false;
+      app.log('search fail', status, json);
+      app.updateButtons();
+    });
+  };
+
+
+  // Таймлайн субтитров совпадает с видео: последняя реплика заканчивается до конца видео,
+  // но не раньше чем за 18% до него (титры). Иначе — другая версия, нужна проверка по звуку.
+  app.timelineOk = function timelineOk(t, done) {
+    var text = app.texts[t.os_id];
+    if (!text) return done(false, 'нет файла');
+    var cues = app.parseCues(text);
+    if (!cues.length) return done(false, 'пустой файл');
+    var c = app.composed(t.os_id);
+    var last = 0;
+    for (var i = 0; i < cues.length; i++) last = Math.max(last, cues[i].end * c.scale + c.offset);
+    app.waitDuration(function (dur) {
+      if (!dur) return done(false, 'длительность видео неизвестна');
+      var r = last / dur;
+      var why = 'последняя реплика ' + app.fmtTime(last).slice(0, 8) + ' из ' + app.fmtTime(dur).slice(0, 8);
+      app.log('таймлайн:', why, r.toFixed(3));
+      done(last <= dur + 5 && r >= 0.82, why);
+    });
+  };
+
+
+  // Автовключение: субтитры скачиваются и синхронизируются по звуку в фоне, а показываются, когда звук подтвердил время.
+  app.startBackground = function startBackground(s, t) {
+    s.bg = t.os_id;
+    s.want = null; // Lampa по своим настройкам может включить дорожку сама — reassert её выключит
+    s.waiting = Date.now();
+    s.useAudio = true;
+    app.selectTrack(null);
+    app.log('фоновая синхронизация', t.label);
+    app.audioStart();
+    app.updateButtons();
+    if (!app.audio) return app.finishBackground('нет звука');
+    // звук так и не подключился (нет аудиодорожки, плеер не отдаёт) — не держим субтитры скрытыми
+    setTimeout(function () {
+      if (app.session === s && s.waiting && (!app.audio || !app.audio.analyser || !app.audio.samples.length)) app.finishBackground('звук не подключился');
+    }, 20000);
+  };
+
+
+  // проверка по звуку завершена (или невозможна) — показываем
+  app.finishBackground = function finishBackground(why) {
+    var s = app.session;
+    if (!s || !s.waiting) return;
+    s.waiting = 0;
+    var t = s.bg && app.findTrack(s.bg);
+    app.log('фон завершён:', why);
+    var d = app.engineDecide();
+    if (t && app.ccWanted() && (why === 'ok' || d.action === 'show')) {
+      app.showTrack(t);
+      if (why === 'ok') app.notify('Субтитры синхронизированы по звуку и включены');
+    } else if (t && app.ccWanted()) {
+      s.calibrate = true;
+      app.notify('Звук не подтвердил синхронизацию (' + why + '). Нажмите CC, чтобы включить субтитры, или выберите фразу в меню');
+    }
+    app.updateButtons();
+  };
+
+  app.turnOn = function turnOn(s, auto, immediate) {
+    var langs = app.langOrder(s);
+    for (var i = 0; i < langs.length; i++) {
+      var src = app.sourceTrackFor([langs[i]]);
+      if (src) {
+        app.showTrack(src);
+        return true;
+      }
+      var cand = s.found[langs[i]];
+      if (cand && cand.length) {
+        s.pending = true;
+        app.updateButtons();
+        app.ensureTrack(cand[0], function (t) {
+          s.pending = false;
+          if (app.session === s && app.ccWanted()) {
+            if (!auto || immediate) {
+              app.showTrack(t);
+              app.maybeAutoSync(t);
+            } else {
+              // автовключение: файл выравнивается по английским, видео — по длительности оригинала и кадрам.
+              // Что делать дальше, решает Decider: verified/estimated — показать (estimated — с меткой на CC),
+              // uncertain/failed — ждать звук или предложить калибровку.
+              app.maybeAutoSync(t);
+              s.pending = true;
+              app.updateButtons();
+              app.durationSync(function () {
+                s.pending = false;
+                if (app.session !== s || !app.ccWanted()) return app.updateButtons();
+                if (app.isMovie(s) && !s.release) app.movieTimeline(s, t);
+                var d = app.engineDecide();
+                app.log('решение:', d.action, 'правило', d.rule, d.reason);
+                if (d.action === 'show') {
+                  app.showTrack(t);
+                  return app.updateButtons();
+                }
+                if (d.action === 'wait') {
+                  app.startBackground(s, t);
+                  return app.updateButtons();
+                }
+                s.calibrate = true;
+                s.bg = t.os_id;
+                app.notify('Субтитры готовы, но синхронизацию не подтвердить. Субтитры → «Синхронизировать по фразе» или нажмите CC');
+                app.updateButtons();
+              });
+              return;
+            }
+          }
+          app.updateButtons();
+        }, function () {
+          s.pending = false;
+          app.updateButtons();
+        });
+        return true;
+      }
+    }
+    // на нужных языках ничего — берём любые субтитры источника
+    var any = app.trackList()[0];
+    if (any) {
+      app.showTrack(any);
+      return true;
+    }
+    if (!auto) Lampa.Noty.show('Субтитры для этого видео не найдены');
+    return false;
+  };
+
+  app.showTrack = function showTrack(track) {
+    if (app.session) {
+      app.session.want = track.os_id || track.label || track.index;
+      app.session.waiting = 0; // показали — фоновое ожидание больше не нужно, звук продолжит доводить время
+    }
+    app.selectTrack(track);
+    app.updateButtons();
+    if (track && track.os_id) {
+      var s1 = app.session;
+      // звук уточняет неподтверждённую модель (у фильмов не нужен) — решает Decider
+      app.durationSync(function () {
+        if (!s1 || app.session !== s1) return;
+        if (app.isMovie(s1) && !s1.release && !s1.timelineHyp) app.movieTimeline(s1, track);
+        var d = app.engineDecide();
+        if (d.listen) {
+          s1.useAudio = true;
+          app.audioStart();
+        }
+      });
+    }
+  };
+
+  app.turnOff = function turnOff() {
+    if (app.session) {
+      app.session.want = null;
+      app.session.waiting = 0;
+    }
+    app.selectTrack(null);
+    app.updateButtons();
+  };
+
+  app.ccWanted = function ccWanted() {
+    return app.flag('cc', false);
+  };
+
+  app.setCc = function setCc(v) {
+    Lampa.Storage.set('opensubs_cc', v ? 'true' : 'false');
+  };
+
+
+  // кнопка CC: включить или выключить
+  app.toggleCc = function toggleCc() {
+    if (app.isShowing()) {
+      app.setCc(false);
+      return app.turnOff();
+    }
+    app.setCc(true);
+    var s = app.session;
+    if (s && s.searching) {
+      s.userTap = true; // нажали сами — покажем сразу, как найдутся
+      app.updateButtons();
+      return Lampa.Noty.show('Ищу субтитры…');
+    }
+    if (s) {
+      if (!app.turnOn(s, false)) app.setCc(false);
+    } else {
+      var any = app.trackList()[0];
+      if (any) app.showTrack(any);
+      else {
+        app.setCc(false);
+        Lampa.Noty.show(app.apiKey() ? 'Субтитры для этого видео не найдены' : 'OpenSubtitles: укажите API-ключ в настройках плагина');
+      }
+    }
+    app.updateButtons();
+  };
+
+
+  // Lampa после загрузки видео сама выбирает дорожку по своим настройкам — возвращаем выбор пользователя
+  app.reassert = function reassert() {
+    var s = app.session;
+    if (!s || typeof s.want === 'undefined') return;
+    var subs = app.trackList();
+    var on = app.isShowing();
+    if (s.want === null) {
+      if (on) app.selectTrack(null);
+    } else {
+      for (var i = 0; i < subs.length; i++) {
+        var id = subs[i].os_id || subs[i].label || subs[i].index;
+        if (id === s.want && on !== subs[i]) {
+          app.selectTrack(subs[i]);
+          break;
+        }
+      }
+    }
+    app.updateButtons();
+  };
+
+
+  // --- файл (профиль субтитров: файл → эталон)
+  app.fileSync = function fileSync(fid) {
+    var p = app.profiles.subs.get(fid);
+    return { scale: p.scale, offset: p.offsetMs / 1000, known: p.known };
+  };
+
+  app.setFileSync = function setFileSync(fid, f) {
+    app.profiles.subs.set(fid, { scale: f.scale, offsetMs: f.offset * 1000 });
+  };
+
+
+  // --- видео
+  app.sourceBal = function sourceBal(s) {
+    var bal = '';
+    try {
+      var last = app.store('online_last_balanser');
+      bal = last[s.card.id] || '';
+    } catch (e) {}
+    if (!bal) {
+      var m = String(s.data.url || '').match(/^https?:\/\/([^\/]+)\/(?:lite\/)?([a-z0-9_-]+)/i);
+      bal = m ? m[1] + '/' + m[2] : '';
+    }
+    return bal;
+  };
+
+
+  // ключ профиля видео: фильм/серия + источник + озвучка
+  app.videoKey = function videoKey(s) {
+    var ep = app.episodeInfo(s.data);
+    return {
+      card: s.card.id,
+      season: ep ? ep.season : null,
+      episode: ep ? ep.episode : null,
+      balancer: app.sourceBal(s),
+      voice: typeof s.data.translate === 'string' ? s.data.translate : (s.data.voice_name || '')
+    };
+  };
+
+  app.currentDurationMs = function currentDurationMs(s) {
+    return s.probe && s.probe.durationMs ? s.probe.durationMs : null;
+  };
+
+  app.videoSync = function videoSync() {
+    var s = app.session;
+    if (!s) return { scale: 1, offset: 0, anchors: [] };
+    if (!s.vsync) {
+      var hit = app.profiles.video.lookup(app.videoKey(s), app.currentDurationMs(s));
+      var c = hit && hit.record;
+      s.vsyncLevel = hit ? hit.level : null;
+      // профиль другого видеорелиза под тем же именем — не применяем, только гипотеза (ADR 4)
+      if (c && hit.level === 'low') {
+        s.lowProfile = c;
+        c = null;
+      }
+      s.vsync = c ? { scale: c.scale, offset: c.offsetMs / 1000, pieces: c.pieces || null, anchors: c.anchors || [], manual: !!c.manual, src: c.src }
+        : { scale: 1, offset: 0, anchors: [] };
+    }
+    return s.vsync;
+  };
+
+
+  // длительность видео стала известна после чтения профиля — проверить, тот ли это видеорелиз
+  app.revalidateProfile = function revalidateProfile(s, videoMs) {
+    var hit = app.profiles.video.lookup(app.videoKey(s), videoMs);
+    if (!hit || hit.level !== 'low' || s.vsyncLevel === 'low') return;
+    app.log('профиль записан для другой длительности видео — только гипотеза');
+    s.lowProfile = hit.record;
+    s.vsyncLevel = 'low';
+    s.vsync = { scale: 1, offset: 0, anchors: [] };
+  };
+
+  app.setVideoSync = function setVideoSync(v) {
+    var s = app.session;
+    if (!s) return;
+    s.vsync = v;
+    var k = app.videoKey(s);
+    if (v.scale === 1 && !v.offset && !v.anchors.length && !v.src) return app.profiles.video.remove(k);
+    var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : app.round3(s.durDiff);
+    app.profiles.video.set(k, { scale: v.scale, offsetMs: v.offset * 1000, pieces: v.pieces, anchors: v.anchors, manual: v.manual, src: v.src,
+      durationMs: app.currentDurationMs(s), dd: dd });
+    s.vsyncLevel = 'high';
+  };
+
+  app.composed = function composed(fid) {
+    var f = app.fileSync(fid);
+    var v = app.videoSync();
+    return { scale: f.scale * v.scale, offset: f.offset * v.scale + v.offset };
+  };
+
+
+  // Время реплики файла → время плеера: файл → эталон (fileSync), эталон → видео (videoSync, возможно по кускам).
+  app.cueFn = function cueFn(fid) {
+    var f = app.fileSync(fid);
+    var v = app.videoSync();
+    var subsP = time.linear(f.scale, f.offset * 1000);
+    var vidP = v.pieces && v.pieces.length > 1 ? v.pieces : time.linear(v.scale, v.offset * 1000);
+    return function (ms) { return time.cueToPlayer(subsP, vidP, ms); };
+  };
+
+
+  // ---------- движок: гипотезы → модель → решение (engine/solver.js, engine/decider.js) ----------
+  // Якорь: «момент o (в координатах эталона) должен показываться в t» — ручная фраза (checkpoint)
+  // или проверка звуком (audio). Модель считает Solver вместе с гипотезами длительности и кадров.
+  app.anchorHyps = function anchorHyps(v) {
+    var out = [];
+    var manualPoint = false;
+    for (var i = 0; i < (v.anchors || []).length; i++) {
+      var a = v.anchors[i];
+      var phrase = a.k === 'phrase';
+      if (phrase) manualPoint = true;
+      out.push({ estimator: phrase ? 'checkpoint' : 'audio', kind: 'offset', offsetMs: Math.round((a.t - a.o) * 1000),
+        fromMs: Math.round(a.t * 1000), toMs: Math.round(a.t * 1000) + 1, sigmaMs: 300, confidence: phrase ? 1 : (a.c || 0.85),
+        evidence: [{ what: phrase ? 'фраза' : 'звук', value: app.round3(a.t - a.o), source: phrase ? 'пользователь' : 'audio' }] });
+    }
+    // ручной сдвиг из меню — тоже решение пользователя
+    if (v.manual && !manualPoint) {
+      var at = Math.max(1000, Math.round(app.videoTime() * 1000));
+      out.push({ estimator: 'checkpoint', kind: 'offset', offsetMs: Math.round(v.offset * 1000), fromMs: at, toMs: at + 1, sigmaMs: 300, confidence: 1,
+        evidence: [{ what: 'сдвиг вручную', value: v.offset, source: 'пользователь' }] });
+    }
+    return out;
+  };
+
+  app.engineHyps = function engineHyps(s, v) {
+    var hs = [];
+    if (s.release) hs = hs.concat(s.release.hypotheses);
+    if (s.fpsHyp) hs.push(s.fpsHyp);
+    if (s.profileHyp) hs.push(s.profileHyp);
+    if (s.timelineHyp) hs.push(s.timelineHyp);
+    if (s.lowProfile) {
+      hs.push({ estimator: 'profile', kind: 'offset', offsetMs: Math.round(s.lowProfile.offsetMs), sigmaMs: 3000, confidence: 0.3,
+        evidence: [{ what: 'профиль другого видеорелиза', value: s.lowProfile.durationMs || null, source: 'profile' }] });
+    }
+    return hs.concat(app.anchorHyps(v || app.videoSync()));
+  };
+
+  app.engineModel = function engineModel(v) {
+    var s = app.session;
+    if (!s) return null;
+    var m = solver.solve(app.engineHyps(s, v), { release: s.release });
+    s.model = m;
+    app.engineEvents.emit('model', m);
+    return m;
+  };
+
+  app.engineDecide = function engineDecide() {
+    var s = app.session;
+    if (!s) return decider.decide(null, {});
+    var m = s.model || app.engineModel();
+    var was = s.shownStatus;
+    var d = decider.decide(m, { movie: app.isMovie(s), canListen: app.canListen(), release: s.release });
+    s.decision = d;
+    s.shownStatus = m.status;
+    app.engineEvents.emit('decision', d); // кнопка CC обновится по событию
+    if (was === 'estimated' && m.status === 'verified' && app.isShowing()) app.notify('Синхронизация субтитров подтверждена');
+    return d;
+  };
+
+  app.fitAnchors = function fitAnchors(v) {
+    if (!v.anchors.length) return v;
+    var m = app.engineModel(v);
+    if (m.status === 'failed') {
+      var last = v.anchors[v.anchors.length - 1];
+      v.offset = last.t - last.o * v.scale;
+      return v;
+    }
+    v.scale = m.pieces[0].scale;
+    v.offset = m.pieces[0].offsetMs / 1000;
+    v.pieces = m.pieces.length > 1 ? m.pieces : null;
+    return v;
+  };
+
+
+  // добавить якорь (старые рядом с ним заменяются)
+  app.addAnchor = function addAnchor(o, t, kind, conf) {
+    var v = app.videoSync();
+    if (kind === 'phrase') v.manual = true;
+    v.anchors = v.anchors.filter(function (x) { return Math.abs(x.o - o) > 90; });
+    v.anchors.push({ o: app.round3(o), t: app.round3(t), k: kind, c: conf || undefined });
+    if (v.anchors.length > 8) v.anchors = v.anchors.slice(-8);
+    v.prior = false;
+    app.setVideoSync(app.fitAnchors(v));
+    if (kind === 'phrase') app.learnResidual();
+    app.resyncAll();
+    app.engineDecide();
+    return v;
+  };
+
+
+  // пользователь выбрал реплику, которая звучит сейчас
+  app.anchorPhrase = function anchorPhrase(track, cue, at) {
+    var f = app.fileSync(track.os_id);
+    var v = app.addAnchor(cue.start * f.scale + f.offset, Math.max(0, at - 0.3), 'phrase');
+    return Math.abs(v.scale - 1) > 0.0005 && v.anchors.length >= 2;
+  };
+
+
+  // ---------- автовыравнивание файла по английским субтитрам ----------
+  // Реплики одного фильма на разных языках начинаются почти в одни моменты. Перебираем пересчёты частоты кадров
+  // и для каждого строим гистограмму разниц «эталон − перевод»: пик даёт сдвиг, высота пика — качество совпадения.
+
+  // Расчёт — estimators/cross-subs.js; sync файла в секундах прототипа.
+  app.cueStartsMs = function cueStartsMs(text, sync) {
+    return subtitle.starts(subtitle.parse(text), sync ? time.linear(sync.scale, sync.offset * 1000) : null);
+  };
+
+
+  // done(result|null, reason)
+  app.autoSync = function autoSync(track, done) {
+    var s = app.session;
+    var fid = track.os_id;
+    var ref = s && reference.reference(s.found.en, track.os_attrs, { fps: s.vidFps });
+    if (!fid || !app.texts[fid]) return done(null, 'нет файла');
+    if (!ref) return done(null, 'нет английских субтитров для сравнения');
+    var rid = ref.files[0].file_id;
+    if (rid === fid) return done(null, 'это и есть английские');
+
+    app.download(rid, function (text) {
+      if (!text) return done(null, 'не удалось скачать английские');
+      app.texts[rid] = app.texts[rid] || text;
+      setTimeout(function () {
+        var est = crossSubs.estimate(app.cueStartsMs(text, app.fileSync(rid)), app.cueStartsMs(app.texts[fid]));
+        if (!est.ok) return done(null, est.reason);
+        var res = { scale: est.result.scale, offset: est.result.offsetMs / 1000, score: est.result.score, ratio: est.result.ratio };
+        app.setFileSync(fid, { scale: res.scale, offset: res.offset });
+        app.resyncAll();
+        done(res);
+      }, 30);
+    }, function () {
+      done(null, 'не удалось скачать английские');
+    });
+  };
+
+  app.fpsName = function fpsName(scale) {
+    for (var i = 0; i < app.FPS.length; i++) {
+      if (app.FPS[i].scale !== 1 && Math.abs(app.FPS[i].scale - scale) < 0.0005) return app.FPS[i].title.split(' (')[0];
+    }
+    return '';
+  };
+
+  app.describeAuto = function describeAuto(res) {
+    var parts = [];
+    var f = app.fpsName(res.scale);
+    if (f) parts.push('кадры ' + f);
+    parts.push('сдвиг ' + (res.offset > 0 ? '+' : '') + res.offset.toFixed(1) + ' с');
+    return parts.join(', ');
+  };
+
+
+  // при первом включении неанглийских субтитров — выровнять файл по английским (один раз на файл)
+  app.maybeAutoSync = function maybeAutoSync(track) {
+    if (!app.flag('autosync', true) || !track || !track.os_id || track.language === 'en') return;
+    if (app.fileSync(track.os_id).known) return;
+    app.autoSync(track, function (res, reason) {
+      if (res) {
+        app.log('по английским:', app.describeAuto(res), 'совпадение', res.ratio.toFixed(2));
+        if (Math.abs(res.offset) > 0.3 || res.scale !== 1) app.notify('Субтитры выровнены: ' + app.describeAuto(res));
+      } else {
+        app.log('по английским не удалось:', reason);
+        app.setFileSync(track.os_id, { scale: 1, offset: 0 }); // не пробовать снова
+      }
+    });
+  };
+
+
+  // ---------- длительность оригинала у источников Lampac ----------
+  // Работа с Lampac — api/lampac.js, плейлисты — probe/hls.js, вывод — engine/diagnostics.js.
+  app.odurGet = function odurGet(key) {
+    var c = app.store('opensubs_odur')[key];
+    if (!c) return null;
+    return { durationMs: c.ms || (c.d ? Math.round(c.d * 1000) : 0) };
+  };
+
+  app.odurSet = function odurSet(key, v) {
+    var all = app.store('opensubs_odur');
+    all[key] = { ms: v.durationMs, t: Date.now() };
+    app.storeSave('opensubs_odur', all, 300);
+  };
+
+  app.lampacCtx = function lampacCtx(s) {
+    var bal = '';
+    try { bal = app.store('online_last_balanser')[s.card.id] || ''; } catch (e) {}
+    var voice = typeof s.data.translate === 'string' ? s.data.translate : (s.data.voice_name || '');
+    return { url: s.data.url, card: s.card, episode: app.episodeInfo(s.data), balancer: bal, voice: voice };
+  };
+
+  app.platformKey = function platformKey(s) {
+    var info = app.lampacApi.info(app.lampacCtx(s));
+    return info ? { card: s.card.id, balancer: info.bal } : null;
+  };
+
+
+  // отбивка площадки, выученная на другой серии этого сериала у этого источника (секунды) — только гипотеза
+  app.residual = function residual(s) {
+    var k = app.platformKey(s);
+    var ms = k && app.profiles.platform.get(k);
+    return typeof ms === 'number' ? ms / 1000 : null;
+  };
+
+
+  // пользователь поправил вручную при известной заставке озвучки → остаток = заставка площадки
+  app.learnResidual = function learnResidual() {
+    var s = app.session;
+    if (!s || s.durDiff === null || typeof s.durDiff === 'undefined') return;
+    var v = app.videoSync();
+    if (Math.abs(v.scale - 1) > 0.0005) return;
+    var k = app.platformKey(s);
+    if (!k) return;
+    var o = app.round3(v.offset - s.durDiff);
+    if (Math.abs(o) > 60) return;
+    app.profiles.platform.set(k, o * 1000);
+    app.log('заставка площадки для сериала:', o);
+  };
+
+  app.waitDuration = function waitDuration(done) {
+    var tries = 0;
+    var tick = function () {
+      var v = null;
+      try { v = Lampa.PlayerVideo.video(); } catch (e) {}
+      var d = v && v.duration;
+      if (d && isFinite(d) && d > 60) return done(d);
+      if (++tries > 60) return done(null);
+      setTimeout(tick, 1000);
+    };
+    tick();
+  };
+
+
+  // done(ok): поправка под это видео посчитана (по длительности оригинала)
+  app.durationSync = function durationSync(done) {
+    var s = app.session;
+    if (!s) return done && done(false);
+    if (s.durDone === 'finished') return done && done(!!s.durOk);
+    (s.durWait = s.durWait || []).push(done || function () {});
+    if (s.durDone) return;
+    s.durDone = true;
+    var finishD = function (ok) {
+      s.durOk = ok;
+      s.durDone = 'finished';
+      var w = s.durWait || [];
+      s.durWait = [];
+      for (var i = 0; i < w.length; i++) try { w[i](ok); } catch (e) { app.log('error', e); }
+    };
+    if (!app.flag('durationsync', true)) return finishD(false);
+
+
+    var applyFpsOnly = function (why) {
+      if (s.palScale && s.palScale !== 1 && !app.videoSync().manual) {
+        app.setVideoSync({ scale: s.palScale, offset: 0, anchors: [], src: 'fps' });
+        app.resyncAll();
+        s.durStatus = why + '; частота кадров: ×' + s.palScale.toFixed(4);
+        app.notify('Субтитры подстроены под частоту кадров видео');
+      }
+    };
+
+    var runDuration = function () {
+    app.lampacApi.originals(app.lampacCtx(s), function (origs, reason) {
+      if (app.session !== s) return;
+      if (!origs.length) {
+        s.durStatus = 'не удалось: ' + reason;
+        app.log('длительность оригинала:', reason);
+        applyFpsOnly(s.durStatus);
+        if (app.isMovie(s)) app.movieTimeline(s);
+        return finishD(false);
+      }
+      var withVideo = function (videoMs, exact) {
+        if (app.session !== s) return;
+        app.revalidateProfile(s, videoMs);
+        var rel = diagnostics.diagnose({ videoMs: videoMs, exact: exact, originals: origs, siblings: s.siblings || [] });
+        // совпадает с оригиналом только одного источника — второй источник ищем среди других озвучек (правило 2)
+        if (rel.cls === 'same' && rel.agree < 2 && !s.siblingsTried) {
+          s.siblingsTried = true;
+          return app.lampacApi.siblings(app.lampacCtx(s), 3, function (list) {
+            s.siblings = list;
+            if (list.length) app.log('другие озвучки:', list.map(function (x) { return x.voice + ' ' + (x.durationMs / 1000).toFixed(2); }).join(', '));
+            withVideo(videoMs, exact);
+          });
+        }
+        s.release = rel;
+        s.durStatus = rel.text;
+        app.log('длительность: видео', (videoMs / 1000).toFixed(2) + (exact ? '' : ' (video.duration)'), 'оригиналы',
+          origs.map(function (o) { return o.source + ' ' + (o.durationMs / 1000).toFixed(2); }).join(', '), '→', rel.cls);
+        s.durDiff = rel.cls === 'insertion' ? rel.deltaMs / 1000 : rel.cls === 'same' || rel.cls === 'near' ? 0 : null;
+        // заставка площадки, выученная на другой серии этого сериала, — только гипотеза с низким доверием (ADR 4)
+        var res = app.residual(s);
+        s.profileHyp = res !== null && s.durDiff !== null ? { estimator: 'profile', kind: 'offset', offsetMs: Math.round((s.durDiff + res) * 1000),
+          sigmaMs: 3000, confidence: 0.3, evidence: [{ what: 'как в другой серии этого источника', value: res, source: 'profile' }] } : null;
+        var old = app.videoSync();
+        if (old.manual) {
+          app.learnResidual(); // ручная поправка этой серии уже есть — узнаём из неё заставку площадки
+          app.engineModel();
+          return finishD(true);
+        }
+        var m = app.engineModel({ anchors: old.anchors || [] });
+        app.log('модель:', m.status, m['class'], (m.pieces[0].offsetMs / 1000).toFixed(2) + ' с', '×' + m.pieces[0].scale.toFixed(4),
+          'уверенность', m.confidence);
+        if (m.status === 'failed' || m.status === 'uncertain') {
+          applyFpsOnly(s.durStatus);
+          return finishD(false);
+        }
+        var v = { scale: m.pieces[0].scale, offset: m.pieces[0].offsetMs / 1000, pieces: m.pieces.length > 1 ? m.pieces : null,
+          anchors: old.anchors || [], src: 'duration' };
+        if (s.palScale && s.palScale !== 1) s.durStatus += '; частота кадров субтитров: ×' + s.palScale.toFixed(4);
+        app.setVideoSync(v);
+        app.resyncAll();
+        if (Math.abs(v.offset - (old.offset || 0)) >= 0.5 || v.scale !== (old.scale || 1)) {
+          app.notify((m.status === 'verified' ? 'Субтитры подстроены под озвучку: ' : 'Субтитры подстроены предварительно: ') + s.durStatus);
+        }
+        finishD(true);
+      };
+      if (s.probe && s.probe.durationMs && s.probe.exact) return withVideo(s.probe.durationMs, true);
+      app.waitDuration(function (cur) {
+        if (app.session !== s) return;
+        if (!cur) {
+          s.durStatus = 'не удалось узнать длительность видео';
+          applyFpsOnly(s.durStatus);
+          return finishD(false);
+        }
+        withVideo(Math.round(cur * 1000), false);
+      });
+    });
+    };
+
+    // характеристики видео (длительность по плейлисту, заявленный FPS), затем длительность оригинала
+    var playerVideo = null;
+    try { playerVideo = Lampa.PlayerVideo.video(); } catch (e) {}
+    app.videoProbe.probe({ url: s.data.url, video: playerVideo }, function (info) {
+      if (app.session !== s) return;
+      s.probe = info;
+      var vf = info.fps.declared || 0;
+      if (info.source === 'ffprobe' && info.fps.measured) s.fpsMeasured = info.fps.measured; // сервер уже посчитал кадры
+      if (info.vfr) app.log('видео с переменной частотой кадров (VFR)');
+      s.vidFps = vf;
+      // эталон — английские того же релиза (ReferenceSelector); если их нет — сам файл показываемых субтитров
+      var bgT = s.bg && app.findTrack(s.bg);
+      var shownT = bgT || app.isShowing();
+      var ref = s.found && reference.reference(s.found.en, shownT && shownT.os_attrs, { fps: vf });
+      var refFps = (ref && parseFloat(ref.fps)) || (bgT && bgT.os_fps) || 0;
+      s.refFps = refFps;
+      var fe = fpsEstimator.estimate({ subsFps: refFps, videoFpsDeclared: vf, videoFpsMeasured: s.fpsMeasured });
+      s.palScale = fe.scale;
+      s.fpsHyp = fe.hypothesis;
+      if (s.palScale !== 1) app.log('кадры: субтитры', refFps, 'видео', vf, '→ ×' + s.palScale.toFixed(4));
+      runDuration();
+      app.measureVideoFps(s, 0);
+    });
+  };
+
+  // Фильм без оригинала (правило 4): укладываются ли реплики в длительность видео — слабая гипотеза
+  app.movieTimeline = function movieTimeline(s, track) {
+    var t = track || (s.bg && app.findTrack(s.bg)) || app.isShowing();
+    if (!t || !t.os_id || !app.texts[t.os_id]) return;
+    var videoMs = s.probe && s.probe.durationMs;
+    if (!videoMs) {
+      try { videoMs = Math.round(Lampa.PlayerVideo.video().duration * 1000) || null; } catch (e) {}
+    }
+    var fn = app.cueFn(t.os_id);
+    var cues = subtitle.parse(app.texts[t.os_id]).map(function (c) { return { startMs: fn(c.startMs), endMs: fn(c.endMs) }; });
+    s.timelineHyp = reference.timeline(cues, videoMs);
+    if (s.timelineHyp) app.log('фильм: реплики укладываются в видео,', s.timelineHyp.evidence[0].value);
+    app.engineModel();
+  };
+
+  // Второй признак частоты кадров (правило 5): замер по кадрам воспроизведения. Метка плейлиста и замер вместе
+  // дают пересчёт с уверенностью 0.8; если замер спорит с меткой — пересчёт не предлагается.
+  app.measureVideoFps = function measureVideoFps(s, tries) {
+    if (app.session !== s || tries > 6 || !s.refFps || s.fpsMeasured) return;
+    var v = null;
+    try { v = Lampa.PlayerVideo.video(); } catch (e) {}
+    var retry = function () { setTimeout(function () { app.measureVideoFps(s, tries + 1); }, 10000); };
+    if (!v || v.paused || v.readyState < 2) return retry();
+    clientProbeLib.measureFps(v, function (fps) {
+      if (app.session !== s) return;
+      if (!fps) return retry();
+      s.fpsMeasured = fps;
+      var fe = fpsEstimator.estimate({ subsFps: s.refFps, videoFpsDeclared: s.vidFps, videoFpsMeasured: fps });
+      var before = s.fpsHyp ? s.fpsHyp.confidence + '|' + s.fpsHyp.scale : 'none';
+      var after = fe.hypothesis ? fe.hypothesis.confidence + '|' + fe.hypothesis.scale : 'none';
+      app.log('кадры: замер', fps.toFixed(2), 'к/с, метка', s.vidFps || '—', '→', fe.reason);
+      if (before === after) return;
+      s.palScale = fe.scale;
+      s.fpsHyp = fe.hypothesis;
+      var old = app.videoSync();
+      if (old.manual) return;
+      var m = app.engineModel({ anchors: old.anchors || [] });
+      if (m.status === 'failed' || m.status === 'uncertain') return app.engineDecide();
+      if (Math.abs(m.pieces[0].scale - old.scale) > 0.0005 || Math.abs(m.pieces[0].offsetMs / 1000 - old.offset) >= 0.3) {
+        app.setVideoSync({ scale: m.pieces[0].scale, offset: m.pieces[0].offsetMs / 1000, pieces: m.pieces.length > 1 ? m.pieces : null,
+          anchors: old.anchors || [], src: old.src || 'fps' });
+        app.resyncAll();
+      }
+      app.engineDecide();
+    });
+  };
+};
+  },
+
   "engine/time": function (module, exports, require) {
 /*
  * Единая шкала времени движка (ADR 6).
@@ -1034,7 +2769,7 @@ module.exports = {
  */
 'use strict';
 
-var ESTIMATORS = ['duration', 'openingInsertion', 'fps', 'crossSubs', 'audio', 'checkpoint', 'profile'];
+var ESTIMATORS = ['duration', 'openingInsertion', 'fps', 'crossSubs', 'audio', 'checkpoint', 'profile', 'timeline'];
 
 var KINDS = [
   'duration_delta',
@@ -1600,326 +3335,43 @@ module.exports = { CONFIRM_MS: CONFIRM_MS, candidate: candidate, confirm: confir
 
   "index": function (module, exports, require) {
 /*
- * Точка входа плагина OpenSubs.
+ * Точка входа плагина OpenSubs (SubtitleEngine).
  *
- * Движок SubtitleEngine собирается по задачам плана (см. README). Пока его части не подключены,
- * весь функционал даёт прототип из legacy/plugin.js — он переносится в модули по частям.
+ * Чистые модули движка (engine/, estimators/, analyzers/subtitle, probe/, api/lampac, profiles/, calibration/)
+ * не знают про Lampa и проверяются в Node. Связь с Lampa — модули-установщики: каждый добавляет свои функции
+ * и состояние в общий объект app, чтобы части интерфейса и конвейера могли вызывать друг друга.
  */
 'use strict';
 
-require('./engine/time');
-require('./engine/types');
-require('./probe/unknown');
-
-require('./legacy/plugin');
-  },
-
-  "legacy/plugin": function (module, exports, require) {
-/*
- * OpenSubs — субтитры OpenSubtitles во встроенном плеере Lampa.
- * Самостоятельный клиентский плагин: сервер Lampac не нужен и не затрагивается.
- * При старте видео ищет субтитры по TMDB/IMDb id (для сериалов — по сезону и серии)
- * и добавляет их в меню субтитров плеера рядом с субтитрами источника.
- */
-(function () {
-  'use strict';
-
-  if (window.opensubs_plugin_ready) return;
+if (!window.opensubs_plugin_ready) {
   window.opensubs_plugin_ready = true;
 
-  var API = 'https://api.opensubtitles.com/api/v1';
-  var UA = 'LampaOpenSubs v1.0';
+  var app = {};
+  require('./app/util')(app);
+  require('./app/services')(app);
+  require('./api/opensubtitles')(app);
+  require('./player/bridge')(app);
+  require('./analyzers/audio-capture')(app);
+  require('./engine/synchronizer')(app);
+  require('./ui/button')(app);
+  require('./ui/menu')(app);
+  require('./app/boot')(app);
+  app.boot();
+}
+  },
 
-  var LANG_NAMES = { ru: 'Русские', uk: 'Українські', en: 'English' };
+  "player/bridge": function (module, exports, require) {
+/*
+ * PlayerBridge: дорожки субтитров плеера Lampa, сборка файла по модели, плавная коррекция.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
 
-  var current = null; // токен текущего видео, чтобы не добавить субтитры к другому
+var subtitle = require('../analyzers/subtitle');
 
-  // модули SubtitleEngine (см. README); прототип переносится в них по задачам плана
-  var http = require('../api/http');
-  var lampacApi = require('../api/lampac').create({ http: http, cache: { get: odurGet, set: odurSet } });
-  var clientProbe = require('../probe/client-probe').create({ http: http });
-  var diagnostics = require('../engine/diagnostics');
-  var time = require('../engine/time');
-  var subtitle = require('../analyzers/subtitle');
-  var crossSubs = require('../estimators/cross-subs');
-  var fpsEstimator = require('../estimators/fps');
-  var solver = require('../engine/solver');
-  var decider = require('../engine/decider');
-  var engineEvents = require('../engine/events').create();
-  var calibration = require('../calibration/checkpoints');
-  var audioEstimator = require('../estimators/audio');
-  // профили (profiles/storage.js): субтитры и видео раздельно, уровни доверия по длительности видео (ADR 4)
-  var profiles = require('../profiles/storage').create({
-    read: function (name) {
-      var v = Lampa.Storage.get(name, '');
-      if (typeof v === 'string' && v) try { v = JSON.parse(v); } catch (e) { v = null; }
-      return v === '' ? null : v;
-    },
-    write: function (name, v) { Lampa.Storage.set(name, v); }
-  });
-
-  function log() {
-    try {
-      var args = Array.prototype.slice.call(arguments);
-      args.unshift('OpenSubs');
-      console.log.apply(console, args);
-    } catch (e) {}
-  }
-
-  function setting(name, def) {
-    var v = Lampa.Storage.get('opensubs_' + name, def);
-    return v === '' || v === null || typeof v === 'undefined' ? def : v;
-  }
-
-  function flag(name, def) {
-    var v = setting(name, def);
-    return v === true || v === 'true';
-  }
-
-  function apiKey() {
-    return String(setting('apikey', '') || '').trim();
-  }
-
-  // ---------- сеть ----------
-
-  function xhr(method, url, body, done, fail) {
-    var r = new XMLHttpRequest();
-    r.open(method, url, true);
-    r.timeout = 15000;
-    r.setRequestHeader('Api-Key', apiKey());
-    r.setRequestHeader('X-User-Agent', UA);
-    r.setRequestHeader('Accept', 'application/json');
-    if (body) r.setRequestHeader('Content-Type', 'application/json');
-    r.onload = function () {
-      var json = null;
-      try { json = JSON.parse(r.responseText); } catch (e) {}
-      if (r.status >= 200 && r.status < 300 && json) done(json);
-      else fail(r.status, json);
-    };
-    r.onerror = function () { fail(0); };
-    r.ontimeout = function () { fail(0); };
-    r.send(body ? JSON.stringify(body) : null);
-  }
-
-  // API OpenSubtitles требует параметры в алфавитном порядке и в нижнем регистре,
-  // иначе отвечает редиректом, который ломает CORS в браузере
-  function query(params) {
-    var keys = Object.keys(params).sort();
-    var out = [];
-    for (var i = 0; i < keys.length; i++) {
-      var v = params[keys[i]];
-      if (v === null || typeof v === 'undefined' || v === '') continue;
-      out.push(keys[i] + '=' + encodeURIComponent(String(v).toLowerCase()).replace(/%2C/g, ','));
-    }
-    return out.join('&');
-  }
-
-  // ---------- хранилище субтитров (IndexedDB на устройстве) ----------
-  // Скачанный файл хранится по file_id: повторный просмотр не тратит дневной лимит OpenSubtitles.
-
-  var DB_NAME = 'opensubs';
-  var STORE = 'files';
-  var DB_MAX = 300; // файлов; VTT обычно 30–150 КБ
-  var dbPromise = null;
-  var blobUrls = [];
-
-  function db(cb) {
-    if (dbPromise === false) return cb(null);
-    if (dbPromise) return dbPromise.push(cb);
-    dbPromise = [cb];
-    var flush = function (d) {
-      var list = dbPromise;
-      dbPromise = d ? { push: function (f) { f(d); } } : false;
-      for (var i = 0; i < list.length; i++) list[i](d);
-    };
-    try {
-      var req = window.indexedDB.open(DB_NAME, 1);
-      req.onupgradeneeded = function () {
-        var s = req.result.createObjectStore(STORE, { keyPath: 'id' });
-        s.createIndex('t', 't');
-      };
-      req.onsuccess = function () { flush(req.result); };
-      req.onerror = req.onblocked = function () { flush(null); };
-    } catch (e) {
-      flush(null);
-    }
-  }
-
-  function storeGet(id, cb) {
-    db(function (d) {
-      if (!d) return cb(null);
-      try {
-        var r = d.transaction(STORE, 'readonly').objectStore(STORE).get(id);
-        r.onsuccess = function () { cb(r.result ? r.result.text : null); };
-        r.onerror = function () { cb(null); };
-      } catch (e) { cb(null); }
-    });
-  }
-
-  function storePut(id, text) {
-    db(function (d) {
-      if (!d) return;
-      try {
-        var s = d.transaction(STORE, 'readwrite').objectStore(STORE);
-        s.put({ id: id, text: text, t: Date.now() });
-        var c = s.count();
-        c.onsuccess = function () {
-          var extra = c.result - DB_MAX;
-          if (extra <= 0) return;
-          s.index('t').openCursor().onsuccess = function (e) {
-            var cur = e.target.result;
-            if (cur && extra-- > 0) {
-              cur.delete();
-              cur['continue']();
-            }
-          };
-        };
-      } catch (e) {}
-    });
-  }
-
-  function storeStats(cb) {
-    db(function (d) {
-      if (!d) return cb(-1);
-      try {
-        var c = d.transaction(STORE, 'readonly').objectStore(STORE).count();
-        c.onsuccess = function () { cb(c.result); };
-        c.onerror = function () { cb(-1); };
-      } catch (e) { cb(-1); }
-    });
-  }
-
-  function storeClear(cb) {
-    db(function (d) {
-      if (!d) return cb && cb();
-      try {
-        var r = d.transaction(STORE, 'readwrite').objectStore(STORE).clear();
-        r.onsuccess = r.onerror = function () { cb && cb(); };
-      } catch (e) { cb && cb(); }
-    });
-  }
-
-  function textUrl(text) {
-    try {
-      var u = URL.createObjectURL(new Blob([text], { type: 'text/vtt' }));
-      blobUrls.push(u);
-      return u;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function revokeUrls() {
-    for (var i = 0; i < blobUrls.length; i++) try { URL.revokeObjectURL(blobUrls[i]); } catch (e) {}
-    blobUrls = [];
-  }
-
-  function fetchText(url, done, fail) {
-    var r = new XMLHttpRequest();
-    r.open('GET', url, true);
-    r.timeout = 20000;
-    r.onload = function () {
-      if (r.status >= 200 && r.status < 300 && /-->/.test(r.responseText)) done(r.responseText);
-      else fail(r.status);
-    };
-    r.onerror = r.ontimeout = function () { fail(0); };
-    r.send(null);
-  }
-
-  // done(text, link): текст файла (из хранилища или свежескачанный); link — прямая ссылка, если текст получить не удалось
-  function download(fileId, done, fail) {
-    storeGet(fileId, function (text) {
-      if (text) return done(text, null);
-
-      xhr('POST', API + '/download', { file_id: fileId, sub_format: 'webvtt' }, function (json) {
-        if (!json.link) return fail(json);
-        fetchText(json.link, function (body) {
-          storePut(fileId, body);
-          done(body, null);
-        }, function () {
-          done(null, json.link);
-        });
-      }, function (status, json) {
-        fail(json || status);
-      });
-    });
-  }
-
-  // ---------- что смотрим ----------
-
-  function activeCard() {
-    try {
-      var a = Lampa.Activity.active();
-      if (!a) return null;
-      return a.movie || a.card || (a.object && (a.object.movie || a.object.card)) || null;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function episodeInfo(data) {
-    var s = parseInt(data.season, 10);
-    var e = parseInt(data.episode, 10);
-    if (!(s > 0 && e > 0)) {
-      var m = String(data.title || '').match(/s(\d{1,2})\s*e(\d{1,3})/i);
-      if (m) {
-        s = parseInt(m[1], 10);
-        e = parseInt(m[2], 10);
-      }
-    }
-    return s > 0 && e > 0 ? { season: s, episode: e } : null;
-  }
-
-  function buildQuery(card, data, langs) {
-    var p = { languages: langs.slice().sort().join(','), order_by: 'download_count' };
-    var isTv = !!(card.name || card.original_name || card.number_of_seasons || data.season);
-    var tmdbOk = card.id && (!card.source || card.source === 'tmdb' || card.source === 'cub');
-    var imdb = parseInt(String(card.imdb_id || '').replace(/^tt/, ''), 10) || ''; // без ведущих нулей, иначе редирект
-
-    if (isTv) {
-      var ep = episodeInfo(data);
-      if (!ep) return null; // без номера серии подберутся субтитры от другой серии
-      p.season_number = ep.season;
-      p.episode_number = ep.episode;
-      if (tmdbOk) p.parent_tmdb_id = card.id;
-      else if (imdb) p.parent_imdb_id = imdb;
-      else p.query = card.original_name || card.name;
-    } else {
-      if (imdb) p.imdb_id = imdb;
-      else if (tmdbOk) p.tmdb_id = card.id;
-      else {
-        p.query = card.original_title || card.title;
-        var y = String(card.release_date || '').slice(0, 4);
-        if (y) p.year = y;
-      }
-    }
-    return p;
-  }
-
-  // Экранки и ранние релизы: свой хронометраж, с онлайн-видео не совпадают
-  var BAD_RELEASE = /(^|[^a-z])(cam|hdcam|camrip|ts|hdts|telesync|tc|hdtc|telecine|scr|screener|dvdscr|bdscr|workprint|r5)([^a-z]|$)/i;
-  // Финальные релизы: онлайн-источники обычно сделаны из них
-  var GOOD_RELEASE = /blu-?ray|bdrip|brrip|bdremux|remux|web-?dl|webrip|web|amzn|nf|dsnp|hmax|atvp|itunes|hdrip|dvdrip/i;
-
-  // релиз прямо с платформы (NF, AMZN, ATVP…) — с её отбивкой в начале, как у онлайн-источников
-  var PLATFORM_RELEASE = /(^|[^a-z])(nf|amzn|atvp|dsnp|hmax|hulu|pcok|pmtp|stan|crav|itunes)([^a-z]|$)/i;
-
-  function score(a) {
-    var rel = String(a.release || '') + ' ' + String((a.files[0] && a.files[0].file_name) || '');
-    var sc = Math.log(1 + (a.download_count || 0)); // 0…~14
-    if (BAD_RELEASE.test(rel)) sc -= 100;
-    if (GOOD_RELEASE.test(rel)) sc += 6;
-    if (PLATFORM_RELEASE.test(rel)) sc += 8;
-    if (a.from_trusted) sc += 3;
-    var fps = parseFloat(a.fps) || 0;
-    if (fps && Math.abs(fps - 23.976) > 0.1 && Math.abs(fps - 24) > 0.1) sc -= 4; // 25/29.97/30 — чаще всего не наш хронометраж
-    if (a.hearing_impaired) sc -= 2;
-    return sc;
-  }
-
+module.exports = function (app) {
   // ---------- плеер ----------
-
-  function videoSubs() {
+  app.videoSubs = function videoSubs() {
     try {
       var v = Lampa.PlayerVideo.video();
       if (!v) return null;
@@ -1927,394 +3379,67 @@ require('./legacy/plugin');
     } catch (e) {
       return null;
     }
-  }
+  };
 
-  // ---------- сеанс текущего видео ----------
-  // Поиск — при старте (бесплатно). Скачивание — только когда субтитры включены кнопкой CC,
-  // и только одного файла на нужном языке; остальные варианты скачиваются при выборе в меню.
-
-  var session = null; // { data, card, audio, found: {lang: [attrs]}, searching, want }
-
-  function langName(code) {
-    return LANG_NAMES[code] || String(code || '').toUpperCase();
-  }
-
-  function normLang(code) {
-    code = String(code || '').toLowerCase();
-    if (code === 'ua') return 'uk';
-    return code.split('-')[0];
-  }
-
-  // язык озвучки: метка дорожки («(EN) Оригинал», «Украинский», «DUB | …»), иначе язык оригинала фильма
-  function detectAudio(data, card) {
-    var tr = typeof data.translate === 'string' ? data.translate : '';
-    var parts = [data.voice_name || '', tr, data.title || ''];
-    for (var i = 0; i < parts.length; i++) {
-      var t = parts[i];
-      if (!t) continue;
-      if (/\((en|eng)\)|\beng\b|english|англ/i.test(t)) return 'en';
-      if (/\((uk|ua|ukr)\)|\bukr\b|україн|украин/i.test(t)) return 'uk';
-      if (/\((ru|rus)\)|\brus\b|русск/i.test(t)) return 'ru';
-      // «Субтитры», «Укр. Субтитры» у источников — оригинальная дорожка с вшитым переводом
-      if (/оригинал|оригінал|original|субтитр|субтитл/i.test(t)) return normLang(card.original_language) || 'en';
-      if (/\b(dub|mvo|avo|dvo)\b|дубл|многогол|двухгол|одногол|закадр|профессион|любительск/i.test(t)) return 'ru';
-      // русские студии озвучки (украинские версии помечены «Украинский» и ловятся выше)
-      if (/lostfilm|hdrezka|rezka|newstudio|tvshows|good ?people|кубик|alexfilm|jaskier|coldfilm|baibako|amedia|ideafilm|кравец|red ?head|сыендук|кураж|бомбей|novamedia|softbox|nexus|gears|anilibria|anidub|кинопоиск|пифагор|невафильм|мосфильм/i.test(t)) return 'ru';
-    }
-    return null;
-  }
-
-  function fallbackLangs() {
-    return String(setting('langs', 'ru,uk,en')).split(',');
-  }
-
-  // порядок языков: выбранный режим (по озвучке или фиксированный), затем запасные
-  function langOrder(s) {
-    var mode = setting('lang', 'audio');
-    var first = mode === 'audio' ? (s && s.audio) : mode;
-    var out = [];
-    var add = function (l) { if (l && out.indexOf(l) < 0) out.push(l); };
-    add(first);
-    var fb = fallbackLangs();
-    for (var i = 0; i < fb.length; i++) add(fb[i]);
-    return out;
-  }
-
-  // лучшие варианты по языкам: {lang: [attrs…]}
-  function groupFound(list, langs) {
-    var groups = {};
-    for (var i = 0; i < list.length; i++) {
-      var a = list[i].attributes;
-      if (!a || !a.files || !a.files.length) continue;
-      if (a.machine_translated || a.ai_translated) continue;
-      var l = normLang(a.language);
-      if (langs.indexOf(l) < 0) continue;
-      a._score = score(a);
-      a._lang = l;
-      (groups[l] = groups[l] || []).push(a);
-    }
-    for (var k in groups) groups[k] = groups[k].sort(function (x, y) { return y._score - x._score; }).slice(0, 3);
-    return groups;
-  }
-
-  function shortRelease(a) {
-    var r = String(a.release || '').replace(/[._]/g, ' ').replace(/\s+/g, ' ').trim();
-    return r.length > 40 ? r.slice(0, 40) + '…' : r;
-  }
-
-  function trackLabel(a) {
-    return langName(a._lang) + ' · OS · ' + shortRelease(a);
-  }
-
-  function notify(text) {
-    if (flag('notify', true)) Lampa.Noty.show(text);
-  }
-
-  function load(data) {
-    session = null;
-    if (!flag('enabled', true)) return;
-    if (data.iptv || data.youtube) return;
-
-    var card = activeCard();
-    if (!card) return log('нет карточки');
-
-    var s = session = { data: data, card: card, audio: detectAudio(data, card), found: {}, searching: false, want: undefined };
-    log('озвучка', s.audio);
-
-    if (!apiKey()) {
-      if (ccWanted()) notify('OpenSubtitles: укажите API-ключ в настройках плагина');
-      return;
-    }
-
-    var langs = langOrder(s);
-    if (langs.indexOf('en') < 0) langs.push('en'); // английские — эталон для автосинхронизации
-    var p = buildQuery(card, data, langs);
-    if (!p) return log('нет номера серии');
-
-    s.searching = true;
-    xhr('GET', API + '/subtitles?' + query(p), null, function (json) {
-      if (session !== s) return;
-      s.searching = false;
-      s.found = groupFound(json.data || [], langs);
-      if (ccWanted()) turnOn(s, true, s.userTap);
-      updateButtons();
-    }, function (status, json) {
-      s.searching = false;
-      log('search fail', status, json);
-      updateButtons();
-    });
-  }
 
   // добавить скачанный файл в список субтитров плеера, вернуть объект дорожки из плеера
-  function ensureTrack(a, done, fail) {
+  app.ensureTrack = function ensureTrack(a, done, fail) {
     var fid = a.files[0].file_id;
-    var have = findTrack(fid);
+    var have = app.findTrack(fid);
     if (have) return done(have);
 
-    download(fid, function (text, link) {
-      if (text) texts[fid] = text;
-      var url = text ? buildTrack(fid) : link;
-      var state = videoSubs();
+    app.download(fid, function (text, link) {
+      if (text) app.texts[fid] = text;
+      var url = text ? app.buildTrack(fid) : link;
+      var state = app.videoSubs();
       if (!url || !state) return fail();
-      var list = copySubs(state.subs);
-      list.push({ label: trackLabel(a), url: url, language: a._lang, opensubs: true, os_id: fid, os_fps: parseFloat(a.fps) || 0, index: list.length });
+      var list = app.copySubs(state.subs);
+      list.push({ label: app.trackLabel(a), url: url, language: a._lang, opensubs: true, os_id: fid, os_fps: parseFloat(a.fps) || 0, os_attrs: a, index: list.length });
       Lampa.Player.subtitles(list);
-      var t = findTrack(fid);
+      var t = app.findTrack(fid);
       t ? done(t) : fail();
     }, function (err) {
-      log('download fail', err);
+      app.log('download fail', err);
       if (err && err.remaining === 0) Lampa.Noty.show('OpenSubtitles: дневной лимит скачиваний исчерпан');
       fail();
     });
-  }
+  };
 
-  function findTrack(fid) {
-    var subs = trackList();
+  app.findTrack = function findTrack(fid) {
+    var subs = app.trackList();
     for (var i = 0; i < subs.length; i++) if (subs[i].os_id === fid) return subs[i];
     return null;
-  }
+  };
+
 
   // Lampa определяет у объектов свойство mode — для повторной передачи берём чистые копии
-  function copySubs(subs) {
+  app.copySubs = function copySubs(subs) {
     return subs.map(function (x, i) {
       var c = {};
       for (var k in x) if (k !== 'mode' && k !== 'ready' && k !== 'selected') c[k] = x[k];
       c.index = i;
       return c;
     });
-  }
+  };
 
-  function sourceTrackFor(langs) {
-    var subs = trackList().filter(function (x) { return !x.opensubs; });
+  app.sourceTrackFor = function sourceTrackFor(langs) {
+    var subs = app.trackList().filter(function (x) { return !x.opensubs; });
     if (!subs.length) return null;
     for (var i = 0; i < langs.length; i++) {
       for (var j = 0; j < subs.length; j++) {
-        var l = normLang(subs[j].language || subs[j].lang || subs[j].srclang);
+        var l = app.normLang(subs[j].language || subs[j].lang || subs[j].srclang);
         if (l === langs[i]) return subs[j];
       }
     }
     return null;
-  }
+  };
 
-  // включить субтитры на нужном языке: субтитры источника на этом языке, иначе лучший файл OpenSubtitles
-  // Можно ли синхронизировать по звуку до показа (встроенный плеер с доступом к звуку)
-  function canListen() {
-    if (!flag('audiosync', true)) return false;
-    try {
-      var v = Lampa.PlayerVideo.video();
-      return !!(v && v.captureStream);
-    } catch (e) {
-      return false;
-    }
-  }
-
-  // Таймлайн субтитров совпадает с видео: последняя реплика заканчивается до конца видео,
-  // но не раньше чем за 18% до него (титры). Иначе — другая версия, нужна проверка по звуку.
-  function timelineOk(t, done) {
-    var text = texts[t.os_id];
-    if (!text) return done(false, 'нет файла');
-    var cues = parseCues(text);
-    if (!cues.length) return done(false, 'пустой файл');
-    var c = composed(t.os_id);
-    var last = 0;
-    for (var i = 0; i < cues.length; i++) last = Math.max(last, cues[i].end * c.scale + c.offset);
-    waitDuration(function (dur) {
-      if (!dur) return done(false, 'длительность видео неизвестна');
-      var r = last / dur;
-      var why = 'последняя реплика ' + fmtTime(last).slice(0, 8) + ' из ' + fmtTime(dur).slice(0, 8);
-      log('таймлайн:', why, r.toFixed(3));
-      done(last <= dur + 5 && r >= 0.82, why);
-    });
-  }
-
-  // Автовключение: субтитры скачиваются и синхронизируются по звуку в фоне, а показываются, когда звук подтвердил время.
-  function startBackground(s, t) {
-    s.bg = t.os_id;
-    s.want = null; // Lampa по своим настройкам может включить дорожку сама — reassert её выключит
-    s.waiting = Date.now();
-    s.useAudio = true;
-    selectTrack(null);
-    log('фоновая синхронизация', t.label);
-    audioStart();
-    updateButtons();
-    if (!audio) return finishBackground('нет звука');
-    // звук так и не подключился (нет аудиодорожки, плеер не отдаёт) — не держим субтитры скрытыми
-    setTimeout(function () {
-      if (session === s && s.waiting && (!audio || !audio.analyser || !audio.samples.length)) finishBackground('звук не подключился');
-    }, 20000);
-  }
-
-  // проверка по звуку завершена (или невозможна) — показываем
-  function finishBackground(why) {
-    var s = session;
-    if (!s || !s.waiting) return;
-    s.waiting = 0;
-    var t = s.bg && findTrack(s.bg);
-    log('фон завершён:', why);
-    var d = engineDecide();
-    if (t && ccWanted() && (why === 'ok' || d.action === 'show')) {
-      showTrack(t);
-      if (why === 'ok') notify('Субтитры синхронизированы по звуку и включены');
-    } else if (t && ccWanted()) {
-      s.calibrate = true;
-      notify('Звук не подтвердил синхронизацию (' + why + '). Нажмите CC, чтобы включить субтитры, или выберите фразу в меню');
-    }
-    updateButtons();
-  }
-
-  function turnOn(s, auto, immediate) {
-    var langs = langOrder(s);
-    for (var i = 0; i < langs.length; i++) {
-      var src = sourceTrackFor([langs[i]]);
-      if (src) {
-        showTrack(src);
-        return true;
-      }
-      var cand = s.found[langs[i]];
-      if (cand && cand.length) {
-        s.pending = true;
-        updateButtons();
-        ensureTrack(cand[0], function (t) {
-          s.pending = false;
-          if (session === s && ccWanted()) {
-            if (!auto || immediate) {
-              showTrack(t);
-              maybeAutoSync(t);
-            } else {
-              // автовключение: файл выравнивается по английским, видео — по длительности оригинала и кадрам.
-              // Что делать дальше, решает Decider: verified/estimated — показать (estimated — с меткой на CC),
-              // uncertain/failed — ждать звук или предложить калибровку.
-              maybeAutoSync(t);
-              s.pending = true;
-              updateButtons();
-              durationSync(function () {
-                s.pending = false;
-                if (session !== s || !ccWanted()) return updateButtons();
-                var d = engineDecide();
-                log('решение:', d.action, 'правило', d.rule, d.reason);
-                if (d.action === 'show') {
-                  showTrack(t);
-                  return updateButtons();
-                }
-                if (d.action === 'wait') {
-                  startBackground(s, t);
-                  return updateButtons();
-                }
-                s.calibrate = true;
-                s.bg = t.os_id;
-                notify('Субтитры готовы, но синхронизацию не подтвердить. Субтитры → «Синхронизировать по фразе» или нажмите CC');
-                updateButtons();
-              });
-              return;
-            }
-          }
-          updateButtons();
-        }, function () {
-          s.pending = false;
-          updateButtons();
-        });
-        return true;
-      }
-    }
-    // на нужных языках ничего — берём любые субтитры источника
-    var any = trackList()[0];
-    if (any) {
-      showTrack(any);
-      return true;
-    }
-    if (!auto) Lampa.Noty.show('Субтитры для этого видео не найдены');
-    return false;
-  }
-
-  function showTrack(track) {
-    if (session) {
-      session.want = track.os_id || track.label || track.index;
-      session.waiting = 0; // показали — фоновое ожидание больше не нужно, звук продолжит доводить время
-    }
-    selectTrack(track);
-    updateButtons();
-    if (track && track.os_id) {
-      var s1 = session;
-      // звук уточняет неподтверждённую модель (у фильмов не нужен) — решает Decider
-      durationSync(function () {
-        if (!s1 || session !== s1) return;
-        var d = engineDecide();
-        if (d.listen) {
-          s1.useAudio = true;
-          audioStart();
-        }
-      });
-    }
-  }
-
-  function turnOff() {
-    if (session) {
-      session.want = null;
-      session.waiting = 0;
-    }
-    selectTrack(null);
-    updateButtons();
-  }
-
-  function isShowing() {
-    var subs = trackList();
+  app.isShowing = function isShowing() {
+    var subs = app.trackList();
     for (var i = 0; i < subs.length; i++) if (subs[i].selected) return subs[i];
     return null;
-  }
+  };
 
-  function ccWanted() {
-    return flag('cc', false);
-  }
-
-  function setCc(v) {
-    Lampa.Storage.set('opensubs_cc', v ? 'true' : 'false');
-  }
-
-  // кнопка CC: включить или выключить
-  function toggleCc() {
-    if (isShowing()) {
-      setCc(false);
-      return turnOff();
-    }
-    setCc(true);
-    var s = session;
-    if (s && s.searching) {
-      s.userTap = true; // нажали сами — покажем сразу, как найдутся
-      updateButtons();
-      return Lampa.Noty.show('Ищу субтитры…');
-    }
-    if (s) {
-      if (!turnOn(s, false)) setCc(false);
-    } else {
-      var any = trackList()[0];
-      if (any) showTrack(any);
-      else {
-        setCc(false);
-        Lampa.Noty.show(apiKey() ? 'Субтитры для этого видео не найдены' : 'OpenSubtitles: укажите API-ключ в настройках плагина');
-      }
-    }
-    updateButtons();
-  }
-
-  // Lampa после загрузки видео сама выбирает дорожку по своим настройкам — возвращаем выбор пользователя
-  function reassert() {
-    var s = session;
-    if (!s || typeof s.want === 'undefined') return;
-    var subs = trackList();
-    var on = isShowing();
-    if (s.want === null) {
-      if (on) selectTrack(null);
-    } else {
-      for (var i = 0; i < subs.length; i++) {
-        var id = subs[i].os_id || subs[i].label || subs[i].index;
-        if (id === s.want && on !== subs[i]) {
-          selectTrack(subs[i]);
-          break;
-        }
-      }
-    }
-    updateButtons();
-  }
 
   // ---------- синхронизация ----------
   // Два уровня поправок времени:
@@ -2322,138 +3447,16 @@ require('./legacy/plugin');
   //   видео → конкретный источник (videoSync, по фильму/серии + источнику + озвучке): заставка студии
   //           (LostFilm, HDRezka…), частота кадров видео, ручные правки, подстройка по звуку.
   // Итог: t' = (t * f.scale + f.offset) * v.scale + v.offset.
+  app.texts = {};
 
-  var texts = {}; // file_id → исходный текст VTT
+  app.applied = {};
 
-  function store(name) {
-    var c = Lampa.Storage.get(name, '{}');
-    if (typeof c === 'string') try { c = JSON.parse(c); } catch (e) { c = {}; }
-    return c && typeof c === 'object' ? c : {};
-  }
-
-  function storeSave(name, all, max) {
-    var keys = Object.keys(all);
-    if (keys.length > max) {
-      keys.sort(function (a, b) { return (all[a].t || 0) - (all[b].t || 0); });
-      for (var i = 0; i < keys.length - max; i++) delete all[keys[i]];
-    }
-    Lampa.Storage.set(name, all);
-  }
-
-  function round3(x) { return Math.round(x * 1000) / 1000; }
-
-  // --- файл (профиль субтитров: файл → эталон)
-  function fileSync(fid) {
-    var p = profiles.subs.get(fid);
-    return { scale: p.scale, offset: p.offsetMs / 1000, known: p.known };
-  }
-
-  function setFileSync(fid, f) {
-    profiles.subs.set(fid, { scale: f.scale, offsetMs: f.offset * 1000 });
-  }
-
-  // --- видео
-  function sourceBal(s) {
-    var bal = '';
-    try {
-      var last = store('online_last_balanser');
-      bal = last[s.card.id] || '';
-    } catch (e) {}
-    if (!bal) {
-      var m = String(s.data.url || '').match(/^https?:\/\/([^\/]+)\/(?:lite\/)?([a-z0-9_-]+)/i);
-      bal = m ? m[1] + '/' + m[2] : '';
-    }
-    return bal;
-  }
-
-  // ключ профиля видео: фильм/серия + источник + озвучка
-  function videoKey(s) {
-    var ep = episodeInfo(s.data);
-    return {
-      card: s.card.id,
-      season: ep ? ep.season : null,
-      episode: ep ? ep.episode : null,
-      balancer: sourceBal(s),
-      voice: typeof s.data.translate === 'string' ? s.data.translate : (s.data.voice_name || '')
-    };
-  }
-
-  function currentDurationMs(s) {
-    return s.probe && s.probe.durationMs ? s.probe.durationMs : null;
-  }
-
-  function videoSync() {
-    var s = session;
-    if (!s) return { scale: 1, offset: 0, anchors: [] };
-    if (!s.vsync) {
-      var hit = profiles.video.lookup(videoKey(s), currentDurationMs(s));
-      var c = hit && hit.record;
-      s.vsyncLevel = hit ? hit.level : null;
-      // профиль другого видеорелиза под тем же именем — не применяем, только гипотеза (ADR 4)
-      if (c && hit.level === 'low') {
-        s.lowProfile = c;
-        c = null;
-      }
-      s.vsync = c ? { scale: c.scale, offset: c.offsetMs / 1000, pieces: c.pieces || null, anchors: c.anchors || [], manual: !!c.manual, src: c.src }
-        : { scale: 1, offset: 0, anchors: [] };
-    }
-    return s.vsync;
-  }
-
-  // длительность видео стала известна после чтения профиля — проверить, тот ли это видеорелиз
-  function revalidateProfile(s, videoMs) {
-    var hit = profiles.video.lookup(videoKey(s), videoMs);
-    if (!hit || hit.level !== 'low' || s.vsyncLevel === 'low') return;
-    log('профиль записан для другой длительности видео — только гипотеза');
-    s.lowProfile = hit.record;
-    s.vsyncLevel = 'low';
-    s.vsync = { scale: 1, offset: 0, anchors: [] };
-  }
-
-  function setVideoSync(v) {
-    var s = session;
-    if (!s) return;
-    s.vsync = v;
-    var k = videoKey(s);
-    if (v.scale === 1 && !v.offset && !v.anchors.length && !v.src) return profiles.video.remove(k);
-    var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : round3(s.durDiff);
-    profiles.video.set(k, { scale: v.scale, offsetMs: v.offset * 1000, pieces: v.pieces, anchors: v.anchors, manual: v.manual, src: v.src,
-      durationMs: currentDurationMs(s), dd: dd });
-    s.vsyncLevel = 'high';
-  }
-
-  function composed(fid) {
-    var f = fileSync(fid);
-    var v = videoSync();
-    return { scale: f.scale * v.scale, offset: f.offset * v.scale + v.offset };
-  }
-
-  // Разбор и пересчёт таймингов — analyzers/subtitle.js (мс); здесь — переходники на секунды прототипа.
-  function fmtTime(t) {
-    return time.formatClock(t * 1000);
-  }
-
-  // реплики файла: [{start, end, text}] в секундах
-  function parseCues(text) {
-    return subtitle.parse(text).map(function (c) { return { start: c.startMs / 1000, end: c.endMs / 1000, text: c.text }; });
-  }
-
-  // Время реплики файла → время плеера: файл → эталон (fileSync), эталон → видео (videoSync, возможно по кускам).
-  function cueFn(fid) {
-    var f = fileSync(fid);
-    var v = videoSync();
-    var subsP = time.linear(f.scale, f.offset * 1000);
-    var vidP = v.pieces && v.pieces.length > 1 ? v.pieces : time.linear(v.scale, v.offset * 1000);
-    return function (ms) { return time.cueToPlayer(subsP, vidP, ms); };
-  }
-
-  var applied = {}; // file_id → [{ start, end }] в секундах плеера, как сейчас показывает плеер
 
   // Файл для плеера. hold: { at, prev } — плавная коррекция: реплики, которые при новой модели
   // всплыли бы посреди показа или повторились бы, в этом файле пропускаются (вернутся при перемотке).
-  function buildTrack(fid, hold) {
-    var fn = cueFn(fid);
-    var cues = subtitle.parse(texts[fid]);
+  app.buildTrack = function buildTrack(fid, hold) {
+    var fn = app.cueFn(fid);
+    var cues = subtitle.parse(app.texts[fid]);
     var out = [];
     var now = [];
     for (var i = 0; i < cues.length; i++) {
@@ -2467,22 +3470,23 @@ require('./legacy/plugin');
       }
       out.push({ startMs: a, endMs: b, text: cues[i].text, raw: cues[i].raw });
     }
-    applied[fid] = now;
-    return textUrl(subtitle.build(out));
-  }
+    app.applied[fid] = now;
+    return app.textUrl(subtitle.build(out));
+  };
+
 
   // пересобрать файлы всех дорожек OpenSubtitles с текущими поправками, выбранную оставить включённой
-  function resyncNow(hold) {
-    var state = videoSubs();
+  app.resyncNow = function resyncNow(hold) {
+    var state = app.videoSubs();
     if (!state) return;
-    var on = isShowing();
+    var on = app.isShowing();
     var onId = on && (on.os_id || on.label);
-    var list = copySubs(state.subs);
+    var list = app.copySubs(state.subs);
     var changed = false;
     for (var j = 0; j < list.length; j++) {
       var fid = list[j].os_id;
-      if (!fid || !texts[fid]) continue;
-      var url = buildTrack(fid, hold && fid === hold.fid ? hold : null);
+      if (!fid || !app.texts[fid]) continue;
+      var url = app.buildTrack(fid, hold && fid === hold.fid ? hold : null);
       if (url) {
         list[j].url = url;
         changed = true;
@@ -2491,31 +3495,33 @@ require('./legacy/plugin');
     if (!changed) return;
     Lampa.Player.subtitles(list);
     if (!onId) return;
-    var now = trackList();
+    var now = app.trackList();
     for (var i = 0; i < now.length; i++) {
       if ((now[i].os_id || now[i].label) === onId) {
-        showTrack(now[i]);
+        app.showTrack(now[i]);
         break;
       }
     }
-  }
+  };
+
 
   // Плавная коррекция (документ, «После показа»): новая модель применяется в паузе между репликами
   // не короче 1 с; реплика на экране досиживает со старыми таймингами; при перемотке — сразу.
-  var resyncTimer = null;
-  function resyncAll() {
-    clearInterval(resyncTimer);
-    var on = isShowing();
+  app.resyncTimer = null;
+
+  app.resyncAll = function resyncAll() {
+    clearInterval(app.resyncTimer);
+    var on = app.isShowing();
     var v = null;
     try { v = Lampa.PlayerVideo.video(); } catch (e) {}
     var fid = on && on.os_id;
-    if (!fid || !applied[fid] || !v || v.paused || v.seeking) return resyncNow();
-    var prev = applied[fid];
+    if (!fid || !app.applied[fid] || !v || v.paused || v.seeking) return app.resyncNow();
+    var prev = app.applied[fid];
     var started = Date.now();
-    var onSeek = function () { stop(); resyncNow(); };
+    var onSeek = function () { stop(); app.resyncNow(); };
     var stop = function () {
-      clearInterval(resyncTimer);
-      resyncTimer = null;
+      clearInterval(app.resyncTimer);
+      app.resyncTimer = null;
       try { v.removeEventListener('seeking', onSeek); } catch (e) {}
     };
     try { v.addEventListener('seeking', onSeek); } catch (e) {}
@@ -2526,868 +3532,17 @@ require('./legacy/plugin');
         for (var i = 0; i < prev.length; i++) if (prev[i].start <= t + 1 && prev[i].end >= t) return;
       }
       stop();
-      resyncNow({ fid: fid, at: t, prev: prev });
+      app.resyncNow({ fid: fid, at: t, prev: prev });
     };
-    resyncTimer = setInterval(tick, 200);
+    app.resyncTimer = setInterval(tick, 200);
     tick();
-  }
+  };
 
-  function videoTime() {
+  app.videoTime = function videoTime() {
     try { return Lampa.PlayerVideo.video().currentTime || 0; } catch (e) { return 0; }
-  }
+  };
 
-  // ---------- движок: гипотезы → модель → решение (engine/solver.js, engine/decider.js) ----------
-  // Якорь: «момент o (в координатах эталона) должен показываться в t» — ручная фраза (checkpoint)
-  // или проверка звуком (audio). Модель считает Solver вместе с гипотезами длительности и кадров.
-
-  function anchorHyps(v) {
-    var out = [];
-    var manualPoint = false;
-    for (var i = 0; i < (v.anchors || []).length; i++) {
-      var a = v.anchors[i];
-      var phrase = a.k === 'phrase';
-      if (phrase) manualPoint = true;
-      out.push({ estimator: phrase ? 'checkpoint' : 'audio', kind: 'offset', offsetMs: Math.round((a.t - a.o) * 1000),
-        fromMs: Math.round(a.t * 1000), toMs: Math.round(a.t * 1000) + 1, sigmaMs: 300, confidence: phrase ? 1 : (a.c || 0.85),
-        evidence: [{ what: phrase ? 'фраза' : 'звук', value: round3(a.t - a.o), source: phrase ? 'пользователь' : 'audio' }] });
-    }
-    // ручной сдвиг из меню — тоже решение пользователя
-    if (v.manual && !manualPoint) {
-      var at = Math.max(1000, Math.round(videoTime() * 1000));
-      out.push({ estimator: 'checkpoint', kind: 'offset', offsetMs: Math.round(v.offset * 1000), fromMs: at, toMs: at + 1, sigmaMs: 300, confidence: 1,
-        evidence: [{ what: 'сдвиг вручную', value: v.offset, source: 'пользователь' }] });
-    }
-    return out;
-  }
-
-  function engineHyps(s, v) {
-    var hs = [];
-    if (s.release) hs = hs.concat(s.release.hypotheses);
-    if (s.fpsHyp) hs.push(s.fpsHyp);
-    if (s.profileHyp) hs.push(s.profileHyp);
-    if (s.lowProfile) {
-      hs.push({ estimator: 'profile', kind: 'offset', offsetMs: Math.round(s.lowProfile.offsetMs), sigmaMs: 3000, confidence: 0.3,
-        evidence: [{ what: 'профиль другого видеорелиза', value: s.lowProfile.durationMs || null, source: 'profile' }] });
-    }
-    return hs.concat(anchorHyps(v || videoSync()));
-  }
-
-  function engineModel(v) {
-    var s = session;
-    if (!s) return null;
-    var m = solver.solve(engineHyps(s, v), { release: s.release });
-    s.model = m;
-    engineEvents.emit('model', m);
-    return m;
-  }
-
-  function engineDecide() {
-    var s = session;
-    if (!s) return decider.decide(null, {});
-    var m = s.model || engineModel();
-    var was = s.decision && s.model && s.model.status;
-    var d = decider.decide(m, { movie: isMovie(s), canListen: canListen(), release: s.release });
-    s.decision = d;
-    engineEvents.emit('decision', d);
-    if (was === 'estimated' && m.status === 'verified' && isShowing()) notify('Синхронизация субтитров подтверждена');
-    updateButtons();
-    return d;
-  }
-
-  function fitAnchors(v) {
-    if (!v.anchors.length) return v;
-    var m = engineModel(v);
-    if (m.status === 'failed') {
-      var last = v.anchors[v.anchors.length - 1];
-      v.offset = last.t - last.o * v.scale;
-      return v;
-    }
-    v.scale = m.pieces[0].scale;
-    v.offset = m.pieces[0].offsetMs / 1000;
-    v.pieces = m.pieces.length > 1 ? m.pieces : null;
-    return v;
-  }
-
-  // добавить якорь (старые рядом с ним заменяются)
-  function addAnchor(o, t, kind, conf) {
-    var v = videoSync();
-    if (kind === 'phrase') v.manual = true;
-    v.anchors = v.anchors.filter(function (x) { return Math.abs(x.o - o) > 90; });
-    v.anchors.push({ o: round3(o), t: round3(t), k: kind, c: conf || undefined });
-    if (v.anchors.length > 8) v.anchors = v.anchors.slice(-8);
-    v.prior = false;
-    setVideoSync(fitAnchors(v));
-    if (kind === 'phrase') learnResidual();
-    resyncAll();
-    engineDecide();
-    return v;
-  }
-
-  // пользователь выбрал реплику, которая звучит сейчас
-  function anchorPhrase(track, cue, at) {
-    var f = fileSync(track.os_id);
-    var v = addAnchor(cue.start * f.scale + f.offset, Math.max(0, at - 0.3), 'phrase');
-    return Math.abs(v.scale - 1) > 0.0005 && v.anchors.length >= 2;
-  }
-
-  // ---------- автовыравнивание файла по английским субтитрам ----------
-  // Реплики одного фильма на разных языках начинаются почти в одни моменты. Перебираем пересчёты частоты кадров
-  // и для каждого строим гистограмму разниц «эталон − перевод»: пик даёт сдвиг, высота пика — качество совпадения.
-
-  // Расчёт — estimators/cross-subs.js; sync файла в секундах прототипа.
-  function cueStartsMs(text, sync) {
-    return subtitle.starts(subtitle.parse(text), sync ? time.linear(sync.scale, sync.offset * 1000) : null);
-  }
-
-  // done(result|null, reason)
-  function autoSync(track, done) {
-    var s = session;
-    var fid = track.os_id;
-    var ref = s && s.found.en && s.found.en[0];
-    if (!fid || !texts[fid]) return done(null, 'нет файла');
-    if (!ref) return done(null, 'нет английских субтитров для сравнения');
-    var rid = ref.files[0].file_id;
-    if (rid === fid) return done(null, 'это и есть английские');
-
-    download(rid, function (text) {
-      if (!text) return done(null, 'не удалось скачать английские');
-      texts[rid] = texts[rid] || text;
-      setTimeout(function () {
-        var est = crossSubs.estimate(cueStartsMs(text, fileSync(rid)), cueStartsMs(texts[fid]));
-        if (!est.ok) return done(null, est.reason);
-        var res = { scale: est.result.scale, offset: est.result.offsetMs / 1000, score: est.result.score, ratio: est.result.ratio };
-        setFileSync(fid, { scale: res.scale, offset: res.offset });
-        resyncAll();
-        done(res);
-      }, 30);
-    }, function () {
-      done(null, 'не удалось скачать английские');
-    });
-  }
-
-  function fpsName(scale) {
-    for (var i = 0; i < FPS.length; i++) {
-      if (FPS[i].scale !== 1 && Math.abs(FPS[i].scale - scale) < 0.0005) return FPS[i].title.split(' (')[0];
-    }
-    return '';
-  }
-
-  function describeAuto(res) {
-    var parts = [];
-    var f = fpsName(res.scale);
-    if (f) parts.push('кадры ' + f);
-    parts.push('сдвиг ' + (res.offset > 0 ? '+' : '') + res.offset.toFixed(1) + ' с');
-    return parts.join(', ');
-  }
-
-  // при первом включении неанглийских субтитров — выровнять файл по английским (один раз на файл)
-  function maybeAutoSync(track) {
-    if (!flag('autosync', true) || !track || !track.os_id || track.language === 'en') return;
-    if (fileSync(track.os_id).known) return;
-    autoSync(track, function (res, reason) {
-      if (res) {
-        log('по английским:', describeAuto(res), 'совпадение', res.ratio.toFixed(2));
-        if (Math.abs(res.offset) > 0.3 || res.scale !== 1) notify('Субтитры выровнены: ' + describeAuto(res));
-      } else {
-        log('по английским не удалось:', reason);
-        setFileSync(track.os_id, { scale: 1, offset: 0 }); // не пробовать снова
-      }
-    });
-  }
-
-  // ---------- длительность оригинала у источников Lampac ----------
-  // Работа с Lampac — api/lampac.js, плейлисты — probe/hls.js, вывод — engine/diagnostics.js.
-
-  function odurGet(key) {
-    var c = store('opensubs_odur')[key];
-    if (!c) return null;
-    return { durationMs: c.ms || (c.d ? Math.round(c.d * 1000) : 0) };
-  }
-
-  function odurSet(key, v) {
-    var all = store('opensubs_odur');
-    all[key] = { ms: v.durationMs, t: Date.now() };
-    storeSave('opensubs_odur', all, 300);
-  }
-
-  function lampacCtx(s) {
-    var bal = '';
-    try { bal = store('online_last_balanser')[s.card.id] || ''; } catch (e) {}
-    return { url: s.data.url, card: s.card, episode: episodeInfo(s.data), balancer: bal };
-  }
-
-  function platformKey(s) {
-    var info = lampacApi.info(lampacCtx(s));
-    return info ? { card: s.card.id, balancer: info.bal } : null;
-  }
-
-  // отбивка площадки, выученная на другой серии этого сериала у этого источника (секунды) — только гипотеза
-  function residual(s) {
-    var k = platformKey(s);
-    var ms = k && profiles.platform.get(k);
-    return typeof ms === 'number' ? ms / 1000 : null;
-  }
-
-  // пользователь поправил вручную при известной заставке озвучки → остаток = заставка площадки
-  function learnResidual() {
-    var s = session;
-    if (!s || s.durDiff === null || typeof s.durDiff === 'undefined') return;
-    var v = videoSync();
-    if (Math.abs(v.scale - 1) > 0.0005) return;
-    var k = platformKey(s);
-    if (!k) return;
-    var o = round3(v.offset - s.durDiff);
-    if (Math.abs(o) > 60) return;
-    profiles.platform.set(k, o * 1000);
-    log('заставка площадки для сериала:', o);
-  }
-
-  function waitDuration(done) {
-    var tries = 0;
-    var tick = function () {
-      var v = null;
-      try { v = Lampa.PlayerVideo.video(); } catch (e) {}
-      var d = v && v.duration;
-      if (d && isFinite(d) && d > 60) return done(d);
-      if (++tries > 60) return done(null);
-      setTimeout(tick, 1000);
-    };
-    tick();
-  }
-
-  function isMovie(s) {
-    return !episodeInfo(s.data) && !(s.card && (s.card.name || s.card.original_name));
-  }
-
-  // done(ok): поправка под это видео посчитана (по длительности оригинала)
-  function durationSync(done) {
-    var s = session;
-    if (!s) return done && done(false);
-    if (s.durDone === 'finished') return done && done(!!s.durOk);
-    (s.durWait = s.durWait || []).push(done || function () {});
-    if (s.durDone) return;
-    s.durDone = true;
-    var finishD = function (ok) {
-      s.durOk = ok;
-      s.durDone = 'finished';
-      var w = s.durWait || [];
-      s.durWait = [];
-      for (var i = 0; i < w.length; i++) try { w[i](ok); } catch (e) { log('error', e); }
-    };
-    if (!flag('durationsync', true)) return finishD(false);
-
-
-    var applyFpsOnly = function (why) {
-      if (s.palScale && s.palScale !== 1 && !videoSync().manual) {
-        setVideoSync({ scale: s.palScale, offset: 0, anchors: [], src: 'fps' });
-        resyncAll();
-        s.durStatus = why + '; частота кадров: ×' + s.palScale.toFixed(4);
-        notify('Субтитры подстроены под частоту кадров видео');
-      }
-    };
-
-    var runDuration = function () {
-    lampacApi.originals(lampacCtx(s), function (origs, reason) {
-      if (session !== s) return;
-      if (!origs.length) {
-        s.durStatus = 'не удалось: ' + reason;
-        log('длительность оригинала:', reason);
-        applyFpsOnly(s.durStatus);
-        return finishD(false);
-      }
-      var withVideo = function (videoMs, exact) {
-        if (session !== s) return;
-        revalidateProfile(s, videoMs);
-        var rel = diagnostics.diagnose({ videoMs: videoMs, exact: exact, originals: origs });
-        s.release = rel;
-        s.durStatus = rel.text;
-        log('длительность: видео', (videoMs / 1000).toFixed(2) + (exact ? '' : ' (video.duration)'), 'оригиналы',
-          origs.map(function (o) { return o.source + ' ' + (o.durationMs / 1000).toFixed(2); }).join(', '), '→', rel.cls);
-        s.durDiff = rel.cls === 'insertion' ? rel.deltaMs / 1000 : rel.cls === 'same' || rel.cls === 'near' ? 0 : null;
-        // заставка площадки, выученная на другой серии этого сериала, — только гипотеза с низким доверием (ADR 4)
-        var res = residual(s);
-        s.profileHyp = res !== null && s.durDiff !== null ? { estimator: 'profile', kind: 'offset', offsetMs: Math.round((s.durDiff + res) * 1000),
-          sigmaMs: 3000, confidence: 0.3, evidence: [{ what: 'как в другой серии этого источника', value: res, source: 'profile' }] } : null;
-        var old = videoSync();
-        if (old.manual) {
-          learnResidual(); // ручная поправка этой серии уже есть — узнаём из неё заставку площадки
-          engineModel();
-          return finishD(true);
-        }
-        var m = engineModel({ anchors: old.anchors || [] });
-        log('модель:', m.status, m['class'], (m.pieces[0].offsetMs / 1000).toFixed(2) + ' с', '×' + m.pieces[0].scale.toFixed(4),
-          'уверенность', m.confidence);
-        if (m.status === 'failed' || m.status === 'uncertain') {
-          applyFpsOnly(s.durStatus);
-          return finishD(false);
-        }
-        var v = { scale: m.pieces[0].scale, offset: m.pieces[0].offsetMs / 1000, pieces: m.pieces.length > 1 ? m.pieces : null,
-          anchors: old.anchors || [], src: 'duration' };
-        if (s.palScale && s.palScale !== 1) s.durStatus += '; частота кадров субтитров: ×' + s.palScale.toFixed(4);
-        setVideoSync(v);
-        resyncAll();
-        if (Math.abs(v.offset - (old.offset || 0)) >= 0.5 || v.scale !== (old.scale || 1)) {
-          notify((m.status === 'verified' ? 'Субтитры подстроены под озвучку: ' : 'Субтитры подстроены предварительно: ') + s.durStatus);
-        }
-        finishD(true);
-      };
-      if (s.probe && s.probe.durationMs && s.probe.exact) return withVideo(s.probe.durationMs, true);
-      waitDuration(function (cur) {
-        if (session !== s) return;
-        if (!cur) {
-          s.durStatus = 'не удалось узнать длительность видео';
-          applyFpsOnly(s.durStatus);
-          return finishD(false);
-        }
-        withVideo(Math.round(cur * 1000), false);
-      });
-    });
-    };
-
-    // характеристики видео (длительность по плейлисту, заявленный FPS), затем длительность оригинала
-    var playerVideo = null;
-    try { playerVideo = Lampa.PlayerVideo.video(); } catch (e) {}
-    clientProbe.probe({ url: s.data.url, video: playerVideo }, function (info) {
-      if (session !== s) return;
-      s.probe = info;
-      var vf = info.fps.declared || 0;
-      s.vidFps = vf;
-      var ref = s.found && s.found.en && s.found.en[0];
-      // эталон — английские; если их нет — сам файл показываемых субтитров
-      var bgT = s.bg && findTrack(s.bg);
-      var refFps = (ref && parseFloat(ref.fps)) || (bgT && bgT.os_fps) || 0;
-      var fe = fpsEstimator.estimate({ subsFps: refFps, videoFpsDeclared: vf });
-      s.palScale = fe.scale;
-      s.fpsHyp = fe.hypothesis;
-      if (s.palScale !== 1) log('кадры: субтитры', refFps, 'видео', vf, '→ ×' + s.palScale.toFixed(4));
-      runDuration();
-    });
-  }
-
-  // ---------- подстройка по звуку ----------
-  // Звук видео (captureStream, воспроизведение не затрагивается) → доля энергии в полосе речи каждые 100 мс.
-  // Раз в 30 с последние 3 минуты сравниваются с интервалами показа субтитров: сдвиг с максимальной корреляцией
-  // и есть поправка. Так находится заставка студии (LostFilm, HDRezka…) и уползание из-за частоты кадров.
-
-  var audio = null;
-  var audioDenied = ''; // почему подстройка по звуку не работает (для меню)
-  var AUDIO_MIN = audioEstimator.MIN;
-  var AUDIO_TARGET = 360; // столько слушаем до показа без уверенности (это же 100% на иконке)
-
-  function audioStop() {
-    if (!audio) return;
-    clearInterval(audio.timer);
-    try { audio.ctx.close(); } catch (e) {}
-    audio = null;
-  }
-
-  function audioStart() {
-    if (!flag('audiosync', true)) return;
-    var v = null;
-    try { v = Lampa.PlayerVideo.video(); } catch (e) {}
-    if (!v || !v.captureStream) { // mozCaptureStream в Firefox глушит звук видео — не используем
-      audioDenied = 'этот плеер не даёт доступ к звуку';
-      return;
-    }
-    audioDenied = '';
-    if (audio && audio.video === v) return;
-    audioStop();
-
-    var Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    audio = { video: v, samples: [], seg: 0, lastT: -1, lastEval: 0, ctx: null, analyser: null, told: false, fails: 0, status: 'ждёт звук видео' };
-    var a = audio;
-
-    var connect = function () {
-      if (a !== audio || a.analyser) return;
-      var stream;
-      try { stream = v.captureStream(); } catch (e) { // чужой домен без CORS
-        log('звук недоступен', e && e.message);
-        audioDenied = 'браузер не даёт читать звук этого видео (другой домен)';
-        audioStop();
-        return finishBackground('нет доступа к звуку');
-      }
-      if (!stream.getAudioTracks().length) return; // дорожка появится после начала воспроизведения
-      try {
-        a.ctx = a.ctx || new Ctx();
-        var src = a.ctx.createMediaStreamSource(stream);
-        var an = a.ctx.createAnalyser();
-        an.fftSize = 1024;
-        an.smoothingTimeConstant = 0;
-        var mute = a.ctx.createGain();
-        mute.gain.value = 0;
-        src.connect(an);
-        an.connect(mute);
-        mute.connect(a.ctx.destination); // анализатор должен быть в графе; звук нулевой
-        a.analyser = an;
-        a.freq = new Float32Array(an.frequencyBinCount);
-        if (a.ctx.state === 'suspended' && a.ctx.resume) a.ctx.resume();
-      } catch (e) {
-        log('звук недоступен', e && e.message);
-        audioDenied = 'ошибка анализа звука: ' + (e && e.message);
-        audioStop();
-        finishBackground('ошибка звука');
-      }
-    };
-
-    a.timer = setInterval(function () {
-      if (a !== audio) return;
-      if (!a.analyser) return connect();
-      if (v.paused || v.seeking || v.readyState < 2) return;
-      var t = v.currentTime;
-      if (a.lastT >= 0 && (t < a.lastT || t - a.lastT > 2)) a.seg++; // перемотка — новый отрезок
-      a.lastT = t;
-      a.analyser.getFloatFrequencyData(a.freq);
-      var hz = a.ctx.sampleRate / 2 / a.freq.length;
-      if (!a.prev) {
-        a.prev = new Float32Array(a.freq.length);
-        for (var pi = 0; pi < a.prev.length; pi++) a.prev[pi] = -200;
-      }
-      // энергия полосы речи (лог) и спектральный поток — estimators/audio.js
-      var ft = audioEstimator.frameFeatures(a.freq, hz, a.prev);
-      if (!a.evals) a.status = 'слушает: ' + Math.round(a.samples.length / 10) + ' с из ' + AUDIO_MIN + ' нужных';
-      a.samples.push({ t: t, e: ft.e, f: ft.f, s: a.seg });
-      if (a.samples.length > 6000) a.samples.splice(0, a.samples.length - 6000);
-      if (Date.now() - a.lastEval > 30000) {
-        a.lastEval = Date.now();
-        setTimeout(audioEvaluate, 0);
-      }
-    }, 100);
-    connect();
-  }
-
-  function audioEvaluate() {
-    var a = audio;
-    var s0 = session;
-    var track = (s0 && s0.waiting && s0.bg && findTrack(s0.bg)) || isShowing();
-    if (!a || !track || !track.os_id || !texts[track.os_id]) return;
-    if (s0 && s0.waiting && Date.now() - s0.waiting > 7 * 60 * 1000) return finishBackground('долго нет результата');
-    var vs0 = videoSync();
-    if (vs0.manual) {
-      a.status = 'не нужна: поправка выставлена вручную';
-      a.evals = (a.evals || 0) + 1;
-      return;
-    }
-
-    var c = composed(track.os_id);
-    var cues = parseCues(texts[track.os_id]);
-    var vs = videoSync();
-    // после расчёта по длительности остаётся только заставка площадки и разница релизов — ищем рядом
-    // широкий поиск (±90 с) — только пока субтитры скрыты и ждут проверки; при показе звук лишь доводит время
-    var dmax = s0 && s0.waiting && !vs.anchors.length && vs.src !== 'duration' ? 90 : 15;
-    var res = audioEstimator.evaluate({
-      samples: a.samples,
-      cues: cues.map(function (q) { return { start: q.start * c.scale + c.offset, end: q.end * c.scale + c.offset }; }),
-      dmaxSec: dmax
-    });
-    if (!res) return;
-    var shift = res.shift, z1 = res.z1, z2 = res.z2;
-    log('звук: сдвиг', shift.toFixed(1), 'z', z1.toFixed(1), 'второй', z2.toFixed(1), res.strong ? 'сильное' : '');
-    a.evals = (a.evals || 0) + 1;
-    var need = res.need;
-    // одинаковый сдвиг в двух проверках подряд — тоже уверенность, даже если каждая чуть ниже порога
-    var prevE = a.lastShift;
-    a.lastShift = { d: shift, z: z1 };
-    var agree = prevE && Math.abs(prevE.d - shift) <= 0.3 && prevE.z >= need - 0.5 && z1 >= need - 0.5 && z2 <= z1 * 0.7;
-    if (res.edge || (!agree && !res.confident)) {
-      a.status = 'слушает ' + Math.round(res.tEnd - res.tStart) + ' с, совпадения нет (уверенность ' + z1.toFixed(1) + ' из ' + need + ')';
-      // полное окно прослушано, а уверенности нет — не показываем вслепую (Decider), предлагаем калибровку
-      if (s0 && s0.waiting && res.tEnd - res.tStart >= AUDIO_TARGET) finishBackground('нет уверенности');
-      return;
-    }
-    a.status = 'последняя проверка: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с (уверенность ' + z1.toFixed(1) + ')';
-
-    var center = (res.tStart + res.tEnd) / 2;
-    var o = (center - vs.offset) / vs.scale;
-    // сильное совпадение подтверждает само (правило 7); слабее — вместе с кандидатом вставки или повтором
-    addAnchor(o, center + shift, 'audio', res.strong || agree ? 0.85 : 0.6);
-    finishBackground('ok');
-    if (!a.told && Math.abs(shift) >= 1) {
-      a.told = true;
-      notify('Субтитры подстроены по звуку: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с');
-    }
-    engineEvents.emit('progress', { value: 1 });
-  }
-
-  // ---------- меню синхронизации ----------
-
-  var FPS = [
-    { title: 'Без изменений', scale: 1 },
-    { title: '25 → 23.976 (субтитры спешат и уползают)', scale: 25 / 23.976 },
-    { title: '23.976 → 25 (субтитры отстают и уползают)', scale: 23.976 / 25 },
-    { title: '24 → 23.976', scale: 24 / 23.976 },
-    { title: '23.976 → 24', scale: 23.976 / 24 },
-    { title: '30 → 23.976', scale: 30 / 23.976 },
-    { title: '23.976 → 30', scale: 23.976 / 30 }
-  ];
-
-  var STEPS = [-5, -2, -1, -0.5, -0.25, 0.25, 0.5, 1, 2, 5];
-
-  function syncTitle() {
-    var v = videoSync();
-    var parts = [];
-    if (Math.abs(v.offset) >= 0.05) parts.push((v.offset > 0 ? '+' : '') + v.offset.toFixed(2) + ' сек.');
-    if (Math.abs(v.scale - 1) > 0.0005) parts.push('скорость ×' + v.scale.toFixed(4));
-    var from = v.manual ? ' (вручную)' : v.src === 'duration' ? ' (по длительности оригинала)' : '';
-    return parts.length ? parts.join(', ') + ' для этого источника' + from : 'Без поправок для этого источника';
-  }
-
-  // back — вернуться в меню субтитров, root — закрыть всё и вернуться к просмотру
-  function syncMenu(track, back, root) {
-    var reopen = function () {
-      closeSelects();
-      syncMenu(track, back, root);
-    };
-    var v = videoSync();
-    var aud = flag('audiosync', true);
-
-    closeSelects();
-    Lampa.Select.show({
-      title: 'Синхронизация',
-      nohide: true,
-      items: [
-        { title: 'По длительности оригинала', subtitle: session && session.durStatus ? session.durStatus : flag('durationsync', true) ? 'Сравнивает с дорожкой «Оригинальный» источника…' : 'Выключено', name: 'dur' },
-        { title: 'Подстройка по звуку', subtitle: !aud ? 'Выключена' : audioDenied ? 'Не работает: ' + audioDenied : audio ? (audio.analyser ? audio.status : 'ждёт звук видео') : 'Не запущена', name: 'audio' },
-        { title: 'По английским субтитрам', subtitle: 'Выровнять файл: частота кадров и сдвиг', name: 'auto' },
-        { title: 'По фразе', subtitle: 'Выберите реплику, которая звучит сейчас', name: 'phrase' },
-        { title: 'Сдвиг', subtitle: syncTitle(), name: 'shift' },
-        { title: 'Частота кадров видео', subtitle: 'Если субтитры уползают всё дальше', name: 'fps' },
-        { title: 'Сбросить для этого источника', subtitle: 'Убрать поправки под это видео', name: 'reset' }
-      ],
-      onBack: back,
-      onSelect: function (a) {
-        if (a.name === 'phrase') return calibrationMenu(track, reopen, root);
-
-        if (a.name === 'dur') {
-          var on = flag('durationsync', true);
-          Lampa.Storage.set('opensubs_durationsync', on ? 'false' : 'true');
-          if (!on && session) { session.durDone = false; session.durWait = []; durationSync(); }
-          return reopen();
-        }
-
-        if (a.name === 'audio') {
-          Lampa.Storage.set('opensubs_audiosync', aud ? 'false' : 'true');
-          if (aud) audioStop();
-          else audioStart();
-          return reopen();
-        }
-
-        if (a.name === 'auto') {
-          Lampa.Noty.show('Сравниваю с английскими субтитрами…');
-          autoSync(track, function (res, reason) {
-            Lampa.Noty.show(res ? 'Выровнено: ' + describeAuto(res) : 'Не получилось: ' + reason);
-          });
-          return root();
-        }
-
-        if (a.name === 'shift') {
-          closeSelects();
-          return Lampa.Select.show({
-            title: 'Сдвиг: ' + syncTitle(),
-            nohide: true,
-            items: STEPS.map(function (x) {
-              return { title: (x > 0 ? 'Позже на ' : 'Раньше на ') + Math.abs(x) + ' сек.', value: x };
-            }),
-            onBack: reopen,
-            onSelect: function (b) {
-              v.offset += b.value;
-              v.manual = true;
-              v.anchors = [];
-              setVideoSync(v);
-              learnResidual();
-              resyncAll();
-              reopen();
-            }
-          });
-        }
-
-        if (a.name === 'fps') {
-          closeSelects();
-          return Lampa.Select.show({
-            title: 'Частота кадров видео',
-            nohide: true,
-            items: FPS.map(function (f) {
-              return { title: f.title, scale: f.scale, selected: Math.abs(f.scale - v.scale) < 0.0005 };
-            }),
-            onBack: reopen,
-            onSelect: function (b) {
-              var t = videoTime(); // текущий момент остаётся на месте, меняется только скорость
-              var o = (t - v.offset) / v.scale;
-              v.scale = b.scale;
-              v.offset = t - o * b.scale;
-              v.manual = true;
-              v.anchors = [];
-              setVideoSync(v);
-              resyncAll();
-              reopen();
-            }
-          });
-        }
-
-        if (a.name === 'reset') {
-          setVideoSync({ scale: 1, offset: 0, anchors: [] });
-          if (session) { session.vsync = null; session.durDone = false; session.durWait = []; }
-          resyncAll();
-          durationSync();
-          if (audio) { audio.samples = []; audio.told = false; }
-          Lampa.Noty.show('Поправки для этого источника сброшены');
-          return reopen();
-        }
-      }
-    });
-  }
-
-  // Калибровка (calibration/checkpoints.js): 3 реплики вокруг текущего момента по текущей модели,
-  // «ни одна не подходит» — следующие 3, «уже совпадают» — текущая модель становится ручной.
-  function calibrationMenu(track, reopen, root, page, at, wasPlaying) {
-    var text = texts[track.os_id] || '';
-    var cues = subtitle.parse(text);
-    if (!cues.length) {
-      Lampa.Noty.show('Не удалось прочитать файл субтитров');
-      return reopen();
-    }
-    page = page || 0;
-    var vid = null;
-    try { vid = Lampa.PlayerVideo.video(); } catch (e) {}
-    if (typeof at !== 'number') {
-      at = videoTime();
-      wasPlaying = vid && !vid.paused;
-      if (wasPlaying) try { vid.pause(); } catch (e) {}
-    }
-    var resume = function () {
-      if (wasPlaying) try { vid.play(); } catch (e) {}
-    };
-    var toPlayer = cueFn(track.os_id);
-    var f = fileSync(track.os_id);
-    var toRef = function (ms) { return ms * f.scale + f.offset * 1000; };
-    var ch = calibration.choices(cues, toPlayer, at * 1000, page);
-    var items = ch.items.map(function (x) {
-      return { title: x.text.length > 90 ? x.text.slice(0, 90) + '…' : x.text, subtitle: fmtTime(x.playerMs / 1000).slice(0, 8), cue: cues[x.index] };
-    });
-    if (ch.more) items.push({ title: 'Ни одна не подходит', subtitle: 'Показать другие реплики', act: 'more' });
-    items.push({ title: 'Субтитры уже совпадают', subtitle: 'Запомнить текущую синхронизацию', act: 'ok' });
-    items.push({ title: 'Полный список реплик', act: 'list' });
-
-    closeSelects();
-    Lampa.Select.show({
-      title: 'Какая фраза звучит сейчас?',
-      nohide: true,
-      items: items,
-      onBack: function () {
-        resume();
-        reopen();
-      },
-      onSelect: function (b) {
-        if (b.act === 'more') return calibrationMenu(track, reopen, root, page + 1, at, wasPlaying);
-        if (b.act === 'list') return phraseMenu(track, reopen, root, at, wasPlaying);
-        var s = session;
-        if (b.act === 'ok') {
-          var v0 = videoSync();
-          addAnchor((at - v0.offset) / v0.scale, at, 'phrase');
-          Lampa.Noty.show('Синхронизация запомнена');
-        } else {
-          var before = videoSync().offset;
-          var pt = calibration.point(b.cue, toRef, at * 1000);
-          var v = addAnchor(pt.o, pt.t, 'phrase');
-          var next = calibration.nextPrompt(before * 1000, v.offset * 1000, s && s.model ? s.model['class'] : 'constant', at * 1000);
-          if (s) s.secondAt = next;
-          Lampa.Noty.show(next ? 'Сдвиг подобран. Через 10 минут предложу проверить ещё раз' : 'Сдвиг подобран');
-        }
-        if (s) s.calibrate = false;
-        if (!isShowing()) {
-          setCc(true);
-          showTrack(track);
-        }
-        resume();
-        root();
-      }
-    });
-  }
-
-  // вторая точка калибровки: подсказка, а не диалог посреди сцены
-  function checkSecondPrompt() {
-    var s = session;
-    if (!s || !s.secondAt || !isShowing()) return;
-    if (videoTime() * 1000 < s.secondAt) return;
-    s.secondAt = null;
-    notify('Проверьте синхронизацию: Субтитры → Синхронизация → По фразе');
-  }
-
-  function phraseMenu(track, reopen, root, atGiven, playingGiven) {
-    var cues = parseCues(texts[track.os_id] || '');
-    if (!cues.length) {
-      Lampa.Noty.show('Не удалось прочитать файл субтитров');
-      return reopen();
-    }
-    var c = composed(track.os_id);
-    var at = typeof atGiven === 'number' ? atGiven : videoTime();
-    var vid = null;
-    try { vid = Lampa.PlayerVideo.video(); } catch (e) {}
-    var wasPlaying = typeof atGiven === 'number' ? playingGiven : vid && !vid.paused;
-    if (wasPlaying && typeof atGiven !== 'number') try { vid.pause(); } catch (e) {}
-    var resume = function () {
-      if (wasPlaying) try { vid.play(); } catch (e) {}
-    };
-
-    var near = 0;
-    for (var i = 0; i < cues.length; i++) if (cues[i].start * c.scale + c.offset <= at) near = i;
-    var from = Math.max(0, near - 25);
-    var to = Math.min(cues.length, near + 15);
-    var items = [];
-    for (var j = from; j < to; j++) {
-      var tt = cues[j].start * c.scale + c.offset;
-      items.push({
-        title: cues[j].text.length > 90 ? cues[j].text.slice(0, 90) + '…' : cues[j].text,
-        subtitle: fmtTime(tt).slice(0, 8),
-        cue: cues[j],
-        selected: j === near
-      });
-    }
-
-    closeSelects();
-    Lampa.Select.show({
-      title: 'Какая фраза звучит сейчас?',
-      nohide: true,
-      items: items,
-      onBack: function () {
-        resume();
-        reopen();
-      },
-      onSelect: function (b) {
-        var both = anchorPhrase(track, b.cue, at);
-        Lampa.Noty.show(both ? 'Сдвиг и скорость подобраны' : 'Сдвиг подобран. Для точности повторите через 10+ минут');
-        resume();
-        root();
-      }
-    });
-  }
-
-  // ---------- кнопка субтитров в плеере ----------
-
-  var SIZES = [
-    { value: 'auto', title: 'Как в Lampa' },
-    { value: 's', title: 'Маленький', em: 1.6 },
-    { value: 'm', title: 'Средний', em: 2 },
-    { value: 'l', title: 'Обычный', em: 2.5 },
-    { value: 'xl', title: 'Крупный', em: 3 },
-    { value: 'xxl', title: 'Очень крупный', em: 3.6 }
-  ];
-
-  var SHADOWS = [
-    { value: 'auto', title: 'Как в Lampa' },
-    { value: 'none', title: 'Без тени' },
-    { value: 'soft', title: 'Мягкая тень' },
-    { value: 'outline', title: 'Обводка' },
-    { value: 'backdrop', title: 'Тёмная подложка' }
-  ];
-
-  // Иконка CC в сетке спрайтов плеера Lampa (21×21, линия 2.5). Выключено — контур, включено — заливка
-  // (буквы вырезаны маской, сквозь них виден фон кнопки).
-  var CC_PATH = 'M9.50 8.37A2.7 2.7 0 1 0 9.50 12.63M15.86 8.37A2.7 2.7 0 1 0 15.86 12.63';
-  var ccSeq = 0;
-
-  // Контур — субтитры выключены; заливка снизу вверх — прогресс (поиск, скачивание, проверка по звуку);
-  // полная заливка — включены. Заливка обрезается прямоугольником clipPath, высоту которого двигает ccTick.
-  function ccIcon() {
-    var n = ++ccSeq;
-    return '<svg viewBox="0 0 21 21" fill="none">' +
-      '<defs><mask id="ops-cc-mask-' + n + '"><rect x="0" y="0" width="21" height="21" fill="#fff"/>' +
-      '<path d="' + CC_PATH + '" stroke="#000" stroke-width="2.3" stroke-linecap="round"/></mask>' +
-      '<clipPath id="ops-cc-clip-' + n + '"><rect class="ops-cc-cliprect" x="0" y="21" width="21" height="0"/></clipPath>' +
-      '<clipPath id="ops-cc-rest-' + n + '"><rect class="ops-cc-restrect" x="0" y="0" width="21" height="21"/></clipPath></defs>' +
-      '<g class="ops-cc-off" clip-path="url(#ops-cc-rest-' + n + ')"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
-      '<path d="' + CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></g>' +
-      '<g class="ops-cc-on" clip-path="url(#ops-cc-clip-' + n + ')"><rect x="0" y="2.5" width="21" height="16" rx="4.4" fill="currentColor" mask="url(#ops-cc-mask-' + n + ')"/></g>' +
-      '<circle class="ops-cc-dot" cx="18.6" cy="4" r="3.1" fill="#f5b400" stroke="rgba(0,0,0,.55)" stroke-width="1.2"/>' +
-      '</svg>';
-  }
-
-  var ccAnim = { p: 0, target: 0, loop: false, t0: 0, timer: null };
-
-  function ccTick() {
-    var tgt = ccAnim.target;
-    if (ccAnim.loop) {
-      var ph = ((Date.now() - ccAnim.t0) % 1800) / 1800;
-      tgt = ph < 0.5 ? ph * 2 : 2 - ph * 2; // заполняется и опустошается, пока идёт работа без известного прогресса
-    }
-    ccAnim.p += (tgt - ccAnim.p) * 0.2;
-    if (Math.abs(tgt - ccAnim.p) < 0.004) ccAnim.p = tgt;
-    // залитая рамка занимает по высоте 2.5…18.5 единиц сетки — заполняем её снизу вверх
-    var h = 16 * ccAnim.p;
-    var rects = document.querySelectorAll('.ops-cc-cliprect');
-    for (var i = 0; i < rects.length; i++) {
-      rects[i].setAttribute('y', String(18.5 - h));
-      rects[i].setAttribute('height', String(h));
-    }
-    // контур виден только над заливкой
-    var rest = document.querySelectorAll('.ops-cc-restrect');
-    for (var j = 0; j < rest.length; j++) rest[j].setAttribute('height', String(ccAnim.p >= 1 ? 0 : 18.5 - h));
-    if (!ccAnim.loop && ccAnim.p === tgt) {
-      clearInterval(ccAnim.timer);
-      ccAnim.timer = null;
-    }
-  }
-
-  function setCcFill(p, loop) {
-    if (loop && !ccAnim.loop) ccAnim.t0 = Date.now() - (ccAnim.p * 900); // продолжаем с текущего уровня
-    ccAnim.loop = !!loop;
-    ccAnim.target = Math.max(0, Math.min(1, p));
-    if (!ccAnim.timer) ccAnim.timer = setInterval(ccTick, 40);
-  }
-
-  function audioProgress() {
-    if (!audio || !audio.samples.length) return 0;
-    var seg = audio.samples[audio.samples.length - 1].s;
-    var first = null, last = 0;
-    for (var i = audio.samples.length - 1; i >= 0 && audio.samples[i].s === seg; i--) first = audio.samples[i].t;
-    last = audio.samples[audio.samples.length - 1].t;
-    return first === null ? 0 : Math.min(0.97, (last - first) / AUDIO_TARGET);
-  }
-
-  var ICON = '<svg viewBox="0 0 21 21" fill="none"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
-    '<path d="' + CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></svg>';
-
-  function css() {
-    if (document.getElementById('opensubs-style')) return;
-    var sel = '.player-video__subtitles';
-    var rules = [
-      'body.ops-has-btn .player-panel__subs{display:none !important}',
-      // метка «синхронизация не подтверждена» (статус estimated, ADR 3)
-      '.ops-btn .ops-cc-dot{display:none}',
-      '.ops-btn.ops-on.ops-unconfirmed .ops-cc-dot{display:inline}',
-
-      'body.ops-shadow-none ' + sel + '{text-shadow:none !important}',
-      'body.ops-shadow-none ' + sel + ' .player-video__subtitles-text{background:none !important}',
-      'body.ops-shadow-soft ' + sel + '{text-shadow:0 0.05em 0.15em rgba(0,0,0,.95),0 0 0.5em rgba(0,0,0,.7) !important}',
-      'body.ops-shadow-soft ' + sel + ' .player-video__subtitles-text{background:none !important}',
-      'body.ops-shadow-outline ' + sel + '{text-shadow:0 2px 1px #000,0 -2px 1px #000,-2px 1px 0 #000,2px 0 1px #000 !important}',
-      'body.ops-shadow-outline ' + sel + ' .player-video__subtitles-text{background:none !important}',
-      'body.ops-shadow-backdrop ' + sel + '{text-shadow:none !important}',
-      'body.ops-shadow-backdrop ' + sel + ' .player-video__subtitles-text{background:rgba(0,0,0,.6) !important;padding:0 .25em}'
-    ];
-    for (var i = 0; i < SIZES.length; i++) {
-      if (SIZES[i].em) rules.push('body.ops-size-' + SIZES[i].value + ' ' + sel + '{font-size:' + SIZES[i].em + 'em !important}');
-    }
-    var st = document.createElement('style');
-    st.id = 'opensubs-style';
-    st.textContent = rules.join('\n');
-    document.head.appendChild(st);
-  }
-
-  function applyStyle() {
-    var b = document.body;
-    var cls = b.className.split(/\s+/).filter(function (c) { return !/^ops-(size|shadow)-/.test(c); });
-    cls.push('ops-size-' + setting('size', 'auto'));
-    cls.push('ops-shadow-' + setting('shadow', 'auto'));
-    b.className = cls.join(' ');
-  }
-
-  function titleOf(list, value) {
-    for (var i = 0; i < list.length; i++) if (list[i].value === value) return list[i].title;
-    return list[0].title;
-  }
-
-  function trackList() {
+  app.trackList = function trackList() {
     try {
       var v = Lampa.PlayerVideo.video();
       if (!v) return [];
@@ -3398,15 +3553,15 @@ require('./legacy/plugin');
     } catch (e) {
       return [];
     }
-  }
+  };
 
-  function cueBox(show) {
+  app.cueBox = function cueBox(show) {
     var box = document.querySelectorAll('.player-video__subtitles');
     for (var i = 0; i < box.length; i++) box[i].classList.toggle('hide', !show);
-  }
+  };
 
-  function selectTrack(track) {
-    var subs = trackList();
+  app.selectTrack = function selectTrack(track) {
+    var subs = app.trackList();
     for (var i = 0; i < subs.length; i++) {
       subs[i].mode = 'disabled';
       subs[i].selected = false;
@@ -3415,334 +3570,9 @@ require('./legacy/plugin');
       track.mode = 'showing';
       track.selected = true;
     }
-    cueBox(!!track);
-  }
-
-  // Новая Lampa складывает селекты в стек; закрываем всё и рисуем меню заново, чтобы подписи были свежими
-  function closeSelects() {
-    if (Lampa.Select.closeAll) Lampa.Select.closeAll();
-    else Lampa.Select.close();
-  }
-
-  // дорожка для калибровки: показанная неподтверждённая или скрытая после неудачной проверки
-  function calibTrack() {
-    var s = session;
-    if (!s) return null;
-    var on = isShowing();
-    if (on && on.os_id && s.decision && s.decision.marker === 'unconfirmed' && !videoSync().manual) return on;
-    if (s.calibrate && s.bg) return findTrack(s.bg);
-    return null;
-  }
-
-  function menu(back) {
-    var subs = trackList();
-    var on = null;
-    for (var i = 0; i < subs.length; i++) if (subs[i].selected || subs[i].mode === 'showing') { on = subs[i]; break; }
-
-    Lampa.Select.show({
-      title: 'Субтитры',
-      nohide: true,
-      items: [
-        { title: 'Язык субтитров', subtitle: (on ? (on.label || on.language || 'Дорожка') : 'Выключены') + (session && session.audio && setting('lang', 'audio') === 'audio' ? ' · озвучка: ' + langName(session.audio) : ''), name: 'lang' },
-        { title: 'Размер шрифта', subtitle: titleOf(SIZES, setting('size', 'auto')), name: 'size' },
-        { title: 'Тень шрифта', subtitle: titleOf(SHADOWS, setting('shadow', 'auto')), name: 'shadow' },
-        { title: 'Синхронизация', subtitle: on && on.os_id ? syncTitle() : 'Для субтитров OpenSubtitles', name: 'sync' }
-      ].concat(calibTrack() ? [{ title: 'Синхронизировать по фразе', subtitle: 'Синхронизация не подтверждена — выберите реплику, которая звучит', name: 'calib' }] : []),
-      onBack: back,
-      onSelect: function (a) {
-        var again = function () {
-          closeSelects();
-          menu(back);
-        };
-
-        if (a.name === 'calib') return calibrationMenu(calibTrack(), again, back);
-
-        if (a.name === 'lang') {
-          var items = [{ title: 'Выключены', selected: !on, act: 'off' }];
-          for (var j = 0; j < subs.length; j++) {
-            items.push({ title: subs[j].label || subs[j].language || ('Дорожка ' + (j + 1)), selected: subs[j] === on, track: subs[j] });
-          }
-          // найденные, но ещё не скачанные варианты OpenSubtitles
-          if (session) {
-            var order = langOrder(session);
-            for (var l = 0; l < order.length; l++) {
-              var cand = session.found[order[l]] || [];
-              for (var c = 0; c < cand.length; c++) {
-                if (findTrack(cand[c].files[0].file_id)) continue;
-                items.push({ title: trackLabel(cand[c]), subtitle: 'Скачать', cand: cand[c] });
-              }
-            }
-          }
-          if (items.length === 1) {
-            Lampa.Noty.show(!apiKey() ? 'OpenSubtitles: укажите API-ключ в настройках плагина' : session && session.searching ? 'Ищу субтитры…' : 'Субтитры для этого видео не найдены');
-            return again();
-          }
-          closeSelects();
-          return Lampa.Select.show({
-            title: 'Язык субтитров',
-            items: items,
-            nohide: true,
-            onBack: again,
-            onSelect: function (b) {
-              if (b.act === 'off') {
-                setCc(false);
-                turnOff();
-              } else if (b.track) {
-                setCc(true);
-                showTrack(b.track);
-                maybeAutoSync(b.track);
-              } else if (b.cand) {
-                setCc(true);
-                ensureTrack(b.cand, function (t) { showTrack(t); maybeAutoSync(t); }, function () {
-                  Lampa.Noty.show('Не удалось скачать субтитры');
-                });
-              }
-              back();
-            }
-          });
-        }
-
-        var list = a.name === 'size' ? SIZES : a.name === 'shadow' ? SHADOWS : null;
-        if (list) {
-          var cur = setting(a.name, 'auto');
-          closeSelects();
-          return Lampa.Select.show({
-            title: a.title,
-            items: list.map(function (o) { return { title: o.title, value: o.value, selected: o.value === cur }; }),
-            nohide: true,
-            onBack: again,
-            onSelect: function (b) {
-              Lampa.Storage.set('opensubs_' + a.name, b.value);
-              applyStyle();
-              again();
-            }
-          });
-        }
-
-        if (a.name === 'sync') {
-          if (!on || !on.os_id || !texts[on.os_id]) {
-            Lampa.Noty.show('Сначала включите субтитры OpenSubtitles');
-            return again();
-          }
-          return syncMenu(on, again, back);
-        }
-      }
-    });
-  }
-
-  function makeButton() {
-    var btn = document.createElement('div');
-    btn.className = 'player-panel__opensubs ops-btn button selector';
-    btn.innerHTML = ccIcon() + '<div class="tooltip">Субтитры</div>';
-    $(btn).on('hover:enter', function () {
-      toggleCc();
-    });
-    return btn;
-  }
-
-  function updateButtons() {
-    var on = !!isShowing();
-    var waiting = !!(session && session.waiting);
-    var pending = !!(session && (session.pending || waiting || (session.searching && ccWanted())));
-    var shown = isShowing();
-    var unconfirmed = !!(shown && shown.os_id && session && session.decision && session.decision.marker === 'unconfirmed' && !videoSync().manual);
-    var btns = document.querySelectorAll('.ops-btn');
-    for (var i = 0; i < btns.length; i++) {
-      btns[i].classList.toggle('ops-on', on);
-      btns[i].classList.toggle('ops-pending', pending && !on);
-      btns[i].classList.toggle('ops-unconfirmed', unconfirmed);
-      var tip = btns[i].querySelector('.tooltip');
-      if (tip) tip.textContent = on ? (unconfirmed ? 'Выключить субтитры (синхронизация не подтверждена)' : 'Выключить субтитры') : waiting ? 'Сверяю субтитры со звуком: ' + Math.round(audioProgress() * 100) + '% — нажмите, чтобы включить сразу' : pending ? 'Готовлю субтитры…' : 'Включить субтитры';
-    }
-    if (on) setCcFill(1, false);
-    else if (waiting && audio && audio.samples.length) {
-      setCcFill(audioProgress(), false); // известный прогресс
-      engineEvents.emit('progress', { value: audioProgress() });
-    }
-    else if (pending) setCcFill(0, true);
-    else setCcFill(0, false);
-  }
-
-  function openSettingsMenu() {
-    var back = function () {
-      closeSelects();
-      Lampa.Controller.toggle(Lampa.Platform.screen('mobile') ? 'player' : 'player_panel');
-    };
-    closeSelects();
-    menu(back);
-  }
-
-  // пункт «Субтитры» в настройках плеера (шестерёнка) открывает наше меню
-  function hookPlayerSettings() {
-    if (!Lampa.Select.listener) return;
-    Lampa.Select.listener.follow('preshow', function (e) {
-      var act = e && e.active;
-      if (!act || !act.items || act._opensubs) return;
-      if (!(Lampa.Player.opened && Lampa.Player.opened())) return;
-      var item = null;
-      for (var i = 0; i < act.items.length; i++) if (act.items[i] && act.items[i].method === 'subs') item = act.items[i];
-      if (!item) return;
-      act._opensubs = true;
-      var on = isShowing();
-      item.subtitle = on ? (on.label || 'Включены') : 'Выключены';
-      var orig = act.onSelect;
-      act.onSelect = function (a) {
-        if (a && a.method === 'subs') return openSettingsMenu();
-        return orig && orig.apply(this, arguments);
-      };
-    });
-  }
-
-  // кнопка — отдельным блоком сразу после выбора качества (и в начале блока кнопок на телефоне)
-  function addButton() {
-    if (document.querySelector('.ops-btn')) return;
-    var quality = document.querySelector('.player-panel__quality');
-    if (!quality) return;
-
-    var box = document.createElement('div');
-    box.className = 'player-panel__box-buttons ops-box';
-    box.appendChild(makeButton());
-    var qbox = quality.parentNode;
-    qbox.parentNode.insertBefore(box, qbox.nextSibling);
-
-    var more = document.querySelector('.player-panel__mobile-more');
-    if (more) more.parentNode.insertBefore(makeButton(), more);
-
-    document.body.classList.add('ops-has-btn');
-  }
-
-  // ---------- настройки ----------
-
-  function settings() {
-    if (!Lampa.SettingsApi) return;
-
-    Lampa.SettingsApi.addComponent({
-      component: 'opensubs',
-      name: 'OpenSubtitles',
-      icon: ICON
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_enabled', type: 'trigger', default: true },
-      field: { name: 'Искать субтитры', description: 'При запуске видео. Включаются кнопкой CC в плеере' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: {
-        name: 'opensubs_lang',
-        type: 'select',
-        values: { audio: 'Как у озвучки', ru: 'Русские', uk: 'Українські', en: 'English' },
-        default: 'audio'
-      },
-      field: { name: 'Язык субтитров', description: '«Как у озвучки» — по выбранной дорожке: (EN) Оригинал → английские, DUB → русские' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: {
-        name: 'opensubs_langs',
-        type: 'select',
-        values: {
-          'ru,uk,en': 'Русские, украинские, английские',
-          'ru,en': 'Русские, английские',
-          'uk,en': 'Украинские, английские',
-          'uk,ru,en': 'Украинские, русские, английские',
-          'en,ru': 'Английские, русские',
-          'en': 'Только английские'
-        },
-        default: 'ru,uk,en'
-      },
-      field: { name: 'Запасные языки', description: 'Если на языке озвучки субтитров нет' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_durationsync', type: 'trigger', default: true },
-      field: { name: 'Заставки озвучек по длительности', description: 'Сравнивать длительность серии в озвучке с дорожкой «Оригинальный» того же источника и сдвигать субтитры на разницу' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_audiosync', type: 'trigger', default: true },
-      field: { name: 'Подстройка по звуку', description: 'Слушать речь в видео и сдвигать субтитры: заставки студий (LostFilm, HDRezka), разная частота кадров' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_autosync', type: 'trigger', default: true },
-      field: { name: 'Автосинхронизация', description: 'Выравнивать русские и украинские субтитры по английским (ещё одно скачивание на фильм)' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_notify', type: 'trigger', default: true },
-      field: { name: 'Уведомления', description: 'Сообщать об отсутствующем API-ключе и других проблемах' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_apikey', type: 'input', values: '', placeholder: 'ключ с opensubtitles.com', default: '' },
-      field: { name: 'API-ключ', description: 'Обязательно. opensubtitles.com → Профиль → API consumers' }
-    });
-
-    Lampa.SettingsApi.addParam({
-      component: 'opensubs',
-      param: { name: 'opensubs_clear', type: 'button' },
-      field: { name: 'Очистить сохранённые субтитры', description: 'Скачанные файлы хранятся на этом устройстве' },
-      onRender: function (item) {
-        storeStats(function (n) {
-          var d = item.find('.settings-param__descr');
-          if (n >= 0) d.text('Сохранено на этом устройстве: ' + n + ' (до ' + DB_MAX + ', старые удаляются сами)');
-          else d.text('Хранилище недоступно на этом устройстве');
-        });
-      },
-      onChange: function () {
-        storeClear(function () {
-          Lampa.Noty.show('OpenSubtitles: сохранённые субтитры удалены');
-          Lampa.Settings.update();
-        });
-      }
-    });
-  }
-
-  function start() {
-    settings();
-    css();
-    applyStyle();
-    addButton();
-    hookPlayerSettings();
-    try {
-      Lampa.PlayerVideo.listener.follow('subs', function () { setTimeout(reassert, 0); });
-    } catch (e) {}
-    var timer = null;
-    Lampa.Player.listener.follow('start', function (data) {
-      addButton();
-      applyStyle();
-      clearInterval(timer);
-      timer = setInterval(function () { updateButtons(); checkSecondPrompt(); }, 1000);
-      audioStop();
-      current = null;
-      revokeUrls(); // файлы прошлого видео больше не нужны
-      try { load(data || {}); } catch (e) { log('error', e); }
-    });
-    Lampa.Player.listener.follow('destroy', function () {
-      current = null;
-      clearInterval(timer); // сеанс не сбрасываем: Lampa шлёт destroy и при переключении серий
-      audioStop();
-    });
-    try { localStorage.removeItem('opensubs_links'); } catch (e) {} // кеш ссылок из первой версии
-    try { if (profiles.migrate()) log('профили перенесены из прежних ключей'); } catch (e) { log('перенос профилей:', e); }
-  }
-
-  if (window.appready) start();
-  else {
-    Lampa.Listener.follow('app', function (e) {
-      if (e.type === 'ready') start();
-    });
-  }
-})();
+    app.cueBox(!!track);
+  };
+};
   },
 
   "probe/client-probe": function (module, exports, require) {
@@ -3830,6 +3660,76 @@ function create(deps) {
 }
 
 module.exports = { create: create, nominalFps: nominalFps, measureFps: measureFps, videoDurationMs: videoDurationMs };
+  },
+
+  "probe/ffprobe": function (module, exports, require) {
+/*
+ * FFProbe — необязательный серверный анализ видео (ADR 1). Плагин сервер не меняет: этот модуль работает,
+ * только если в настройке opensubs_ffprobe указан адрес службы, которая отвечает выводом
+ *   ffprobe -v error -print_format json -show_format -show_streams <url>
+ * (адрес получает ?url=<ссылка на видео>). Без настройки или при ошибке — ClientProbe.
+ *
+ * parse(json) → ProbeInfo { source: 'ffprobe', exact, durationMs, fps { declared, measured }, vfr, streams[] }
+ *   declared = r_frame_rate, measured = avg_frame_rate; VFR — если они заметно различаются;
+ *   start потоков (start_time) — для явного перевода шкал в engine/time.js.
+ */
+'use strict';
+
+var types = require('../engine/types');
+
+function rate(s) {
+  var m = /^(\d+)\/(\d+)$/.exec(String(s || ''));
+  if (m) return Number(m[2]) ? Number(m[1]) / Number(m[2]) : null;
+  var f = parseFloat(s);
+  return isFinite(f) && f > 0 ? f : null;
+}
+
+function ms(sec) {
+  var f = parseFloat(sec);
+  return isFinite(f) ? Math.round(f * 1000) : null;
+}
+
+function parse(json) {
+  var streams = (json && json.streams) || [];
+  var video = null;
+  var out = [];
+  for (var i = 0; i < streams.length; i++) {
+    var st = streams[i];
+    if (st.codec_type !== 'video' && st.codec_type !== 'audio') continue;
+    if (st.codec_type === 'video' && !video) video = st;
+    out.push({ kind: st.codec_type, startMs: ms(st.start_time) || 0, durationMs: ms(st.duration), timeBase: st.time_base || null });
+  }
+  var declared = video ? rate(video.r_frame_rate) : null;
+  var measured = video ? rate(video.avg_frame_rate) : null;
+  return types.probeInfo({
+    source: 'ffprobe',
+    exact: true,
+    durationMs: ms(json && json.format && json.format.duration) || (video && ms(video.duration)),
+    fps: { declared: declared, measured: measured },
+    vfr: declared && measured ? Math.abs(declared - measured) > 0.05 : null,
+    streams: out
+  });
+}
+
+// endpoint — адрес службы; fallback — ClientProbe
+function create(deps) {
+  var http = deps.http;
+  var endpoint = deps.endpoint;
+  var fallback = deps.fallback;
+  function probe(req, done) {
+    if (!endpoint) return fallback.probe(req, done);
+    var url = endpoint + (endpoint.indexOf('?') >= 0 ? '&' : '?') + 'url=' + encodeURIComponent(req.url || '');
+    http.getJSON(url, function (json) {
+      var info = null;
+      try { info = parse(json); } catch (e) {}
+      if (info && info.durationMs) done(info);
+      else fallback.probe(req, done);
+    }, function () { fallback.probe(req, done); });
+  }
+  return { name: 'ffprobe', probe: probe };
+}
+
+module.exports = { create: create, parse: parse, rate: rate };
   },
 
   "probe/hls": function (module, exports, require) {
@@ -4068,6 +3968,611 @@ function create(io, now) {
 }
 
 module.exports = { create: create, NAMES: NAMES, videoKey: videoKey, platformKey: platformKey, SAME_DURATION_MS: SAME_DURATION_MS };
+  },
+
+  "ui/button": function (module, exports, require) {
+/*
+ * Кнопка CC в панели плеера: иконка с заливкой прогресса и меткой «не подтверждено», стили.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+module.exports = function (app) {
+  // состояние кнопки приходит событиями движка (engine/events.js): решение Decider и прогресс проверки по звуку
+  app.ui = { decision: null, progress: 0 };
+  app.engineEvents.on('decision', function (d) {
+    app.ui.decision = d;
+    app.updateButtons();
+  });
+  app.engineEvents.on('progress', function (p) {
+    app.ui.progress = p.value;
+  });
+  app.engineEvents.on('reset', function () {
+    app.ui.decision = null;
+    app.ui.progress = 0;
+  });
+
+  // Иконка CC в сетке спрайтов плеера Lampa (21×21, линия 2.5). Выключено — контур, включено — заливка
+  // (буквы вырезаны маской, сквозь них виден фон кнопки).
+  app.CC_PATH = 'M9.50 8.37A2.7 2.7 0 1 0 9.50 12.63M15.86 8.37A2.7 2.7 0 1 0 15.86 12.63';
+
+  app.ccSeq = 0;
+
+
+  // Контур — субтитры выключены; заливка снизу вверх — прогресс (поиск, скачивание, проверка по звуку);
+  // полная заливка — включены. Заливка обрезается прямоугольником clipPath, высоту которого двигает ccTick.
+  app.ccIcon = function ccIcon() {
+    var n = ++app.ccSeq;
+    return '<svg viewBox="0 0 21 21" fill="none">' +
+      '<defs><mask id="ops-cc-mask-' + n + '"><rect x="0" y="0" width="21" height="21" fill="#fff"/>' +
+      '<path d="' + app.CC_PATH + '" stroke="#000" stroke-width="2.3" stroke-linecap="round"/></mask>' +
+      '<clipPath id="ops-cc-clip-' + n + '"><rect class="ops-cc-cliprect" x="0" y="21" width="21" height="0"/></clipPath>' +
+      '<clipPath id="ops-cc-rest-' + n + '"><rect class="ops-cc-restrect" x="0" y="0" width="21" height="21"/></clipPath></defs>' +
+      '<g class="ops-cc-off" clip-path="url(#ops-cc-rest-' + n + ')"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
+      '<path d="' + app.CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></g>' +
+      '<g class="ops-cc-on" clip-path="url(#ops-cc-clip-' + n + ')"><rect x="0" y="2.5" width="21" height="16" rx="4.4" fill="currentColor" mask="url(#ops-cc-mask-' + n + ')"/></g>' +
+      '<circle class="ops-cc-dot" cx="18.6" cy="4" r="3.1" fill="#f5b400" stroke="rgba(0,0,0,.55)" stroke-width="1.2"/>' +
+      '</svg>';
+  };
+
+  app.ccAnim = { p: 0, target: 0, loop: false, t0: 0, timer: null };
+
+  app.ccTick = function ccTick() {
+    var tgt = app.ccAnim.target;
+    if (app.ccAnim.loop) {
+      var ph = ((Date.now() - app.ccAnim.t0) % 1800) / 1800;
+      tgt = ph < 0.5 ? ph * 2 : 2 - ph * 2; // заполняется и опустошается, пока идёт работа без известного прогресса
+    }
+    app.ccAnim.p += (tgt - app.ccAnim.p) * 0.2;
+    if (Math.abs(tgt - app.ccAnim.p) < 0.004) app.ccAnim.p = tgt;
+    // залитая рамка занимает по высоте 2.5…18.5 единиц сетки — заполняем её снизу вверх
+    var h = 16 * app.ccAnim.p;
+    var rects = document.querySelectorAll('.ops-cc-cliprect');
+    for (var i = 0; i < rects.length; i++) {
+      rects[i].setAttribute('y', String(18.5 - h));
+      rects[i].setAttribute('height', String(h));
+    }
+    // контур виден только над заливкой
+    var rest = document.querySelectorAll('.ops-cc-restrect');
+    for (var j = 0; j < rest.length; j++) rest[j].setAttribute('height', String(app.ccAnim.p >= 1 ? 0 : 18.5 - h));
+    if (!app.ccAnim.loop && app.ccAnim.p === tgt) {
+      clearInterval(app.ccAnim.timer);
+      app.ccAnim.timer = null;
+    }
+  };
+
+  app.setCcFill = function setCcFill(p, loop) {
+    if (loop && !app.ccAnim.loop) app.ccAnim.t0 = Date.now() - (app.ccAnim.p * 900); // продолжаем с текущего уровня
+    app.ccAnim.loop = !!loop;
+    app.ccAnim.target = Math.max(0, Math.min(1, p));
+    if (!app.ccAnim.timer) app.ccAnim.timer = setInterval(app.ccTick, 40);
+  };
+
+  app.ICON = '<svg viewBox="0 0 21 21" fill="none"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
+    '<path d="' + app.CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></svg>';
+
+  app.css = function css() {
+    if (document.getElementById('opensubs-style')) return;
+    var sel = '.player-video__subtitles';
+    var rules = [
+      'body.ops-has-btn .player-panel__subs{display:none !important}',
+      // метка «синхронизация не подтверждена» (статус estimated, ADR 3)
+      '.ops-btn .ops-cc-dot{display:none}',
+      '.ops-btn.ops-on.ops-unconfirmed .ops-cc-dot{display:inline}',
+
+      'body.ops-shadow-none ' + sel + '{text-shadow:none !important}',
+      'body.ops-shadow-none ' + sel + ' .player-video__subtitles-text{background:none !important}',
+      'body.ops-shadow-soft ' + sel + '{text-shadow:0 0.05em 0.15em rgba(0,0,0,.95),0 0 0.5em rgba(0,0,0,.7) !important}',
+      'body.ops-shadow-soft ' + sel + ' .player-video__subtitles-text{background:none !important}',
+      'body.ops-shadow-outline ' + sel + '{text-shadow:0 2px 1px #000,0 -2px 1px #000,-2px 1px 0 #000,2px 0 1px #000 !important}',
+      'body.ops-shadow-outline ' + sel + ' .player-video__subtitles-text{background:none !important}',
+      'body.ops-shadow-backdrop ' + sel + '{text-shadow:none !important}',
+      'body.ops-shadow-backdrop ' + sel + ' .player-video__subtitles-text{background:rgba(0,0,0,.6) !important;padding:0 .25em}'
+    ];
+    for (var i = 0; i < app.SIZES.length; i++) {
+      if (app.SIZES[i].em) rules.push('body.ops-size-' + app.SIZES[i].value + ' ' + sel + '{font-size:' + app.SIZES[i].em + 'em !important}');
+    }
+    var st = document.createElement('style');
+    st.id = 'opensubs-style';
+    st.textContent = rules.join('\n');
+    document.head.appendChild(st);
+  };
+
+  app.applyStyle = function applyStyle() {
+    var b = document.body;
+    var cls = b.className.split(/\s+/).filter(function (c) { return !/^ops-(size|shadow)-/.test(c); });
+    cls.push('ops-size-' + app.setting('size', 'auto'));
+    cls.push('ops-shadow-' + app.setting('shadow', 'auto'));
+    b.className = cls.join(' ');
+  };
+
+  app.makeButton = function makeButton() {
+    var btn = document.createElement('div');
+    btn.className = 'player-panel__opensubs ops-btn button selector';
+    btn.innerHTML = app.ccIcon() + '<div class="tooltip">Субтитры</div>';
+    $(btn).on('hover:enter', function () {
+      app.toggleCc();
+    });
+    return btn;
+  };
+
+  app.updateButtons = function updateButtons() {
+    var on = !!app.isShowing();
+    var waiting = !!(app.session && app.session.waiting);
+    var pending = !!(app.session && (app.session.pending || waiting || (app.session.searching && app.ccWanted())));
+    var shown = app.isShowing();
+    var d = app.ui.decision;
+    var unconfirmed = !!(shown && shown.os_id && d && d.marker === 'unconfirmed' && !app.videoSync().manual);
+    var btns = document.querySelectorAll('.ops-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('ops-on', on);
+      btns[i].classList.toggle('ops-pending', pending && !on);
+      btns[i].classList.toggle('ops-unconfirmed', unconfirmed);
+      var tip = btns[i].querySelector('.tooltip');
+      if (tip) tip.textContent = on ? (unconfirmed ? 'Выключить субтитры (синхронизация не подтверждена)' : 'Выключить субтитры') : waiting ? 'Сверяю субтитры со звуком: ' + Math.round(app.audioProgress() * 100) + '% — нажмите, чтобы включить сразу' : pending ? 'Готовлю субтитры…' : 'Включить субтитры';
+    }
+    if (on) app.setCcFill(1, false);
+    else if (waiting && app.ui.progress > 0) app.setCcFill(app.ui.progress, false); // известный прогресс проверки по звуку
+    else if (pending) app.setCcFill(0, true);
+    else app.setCcFill(0, false);
+  };
+
+
+  // кнопка — отдельным блоком сразу после выбора качества (и в начале блока кнопок на телефоне)
+  app.addButton = function addButton() {
+    if (document.querySelector('.ops-btn')) return;
+    var quality = document.querySelector('.player-panel__quality');
+    if (!quality) return;
+
+    var box = document.createElement('div');
+    box.className = 'player-panel__box-buttons ops-box';
+    box.appendChild(app.makeButton());
+    var qbox = quality.parentNode;
+    qbox.parentNode.insertBefore(box, qbox.nextSibling);
+
+    var more = document.querySelector('.player-panel__mobile-more');
+    if (more) more.parentNode.insertBefore(app.makeButton(), more);
+
+    document.body.classList.add('ops-has-btn');
+  };
+};
+  },
+
+  "ui/menu": function (module, exports, require) {
+/*
+ * Меню «Субтитры» в плеере: язык, вид, синхронизация, калибровка по фразе.
+ * Устанавливается в общий объект app (см. index.js): функции и состояние доступны как app.*.
+ */
+'use strict';
+
+var calibration = require('../calibration/checkpoints');
+var subtitle = require('../analyzers/subtitle');
+
+module.exports = function (app) {
+  // ---------- меню синхронизации ----------
+  app.FPS = [
+    { title: 'Без изменений', scale: 1 },
+    { title: '25 → 23.976 (субтитры спешат и уползают)', scale: 25 / 23.976 },
+    { title: '23.976 → 25 (субтитры отстают и уползают)', scale: 23.976 / 25 },
+    { title: '24 → 23.976', scale: 24 / 23.976 },
+    { title: '23.976 → 24', scale: 23.976 / 24 },
+    { title: '30 → 23.976', scale: 30 / 23.976 },
+    { title: '23.976 → 30', scale: 23.976 / 30 }
+  ];
+
+  app.STEPS = [-5, -2, -1, -0.5, -0.25, 0.25, 0.5, 1, 2, 5];
+
+  app.syncTitle = function syncTitle() {
+    var v = app.videoSync();
+    var parts = [];
+    if (Math.abs(v.offset) >= 0.05) parts.push((v.offset > 0 ? '+' : '') + v.offset.toFixed(2) + ' сек.');
+    if (Math.abs(v.scale - 1) > 0.0005) parts.push('скорость ×' + v.scale.toFixed(4));
+    var from = v.manual ? ' (вручную)' : v.src === 'duration' ? ' (по длительности оригинала)' : '';
+    return parts.length ? parts.join(', ') + ' для этого источника' + from : 'Без поправок для этого источника';
+  };
+
+
+  // back — вернуться в меню субтитров, root — закрыть всё и вернуться к просмотру
+  app.syncMenu = function syncMenu(track, back, root) {
+    var reopen = function () {
+      app.closeSelects();
+      app.syncMenu(track, back, root);
+    };
+    var v = app.videoSync();
+    var aud = app.flag('audiosync', true);
+
+    app.closeSelects();
+    Lampa.Select.show({
+      title: 'Синхронизация',
+      nohide: true,
+      items: [
+        { title: 'По длительности оригинала', subtitle: app.session && app.session.durStatus ? app.session.durStatus : app.flag('durationsync', true) ? 'Сравнивает с дорожкой «Оригинальный» источника…' : 'Выключено', name: 'dur' },
+        { title: 'Подстройка по звуку', subtitle: !aud ? 'Выключена' : app.audioDenied ? 'Не работает: ' + app.audioDenied : app.audio ? (app.audio.analyser ? app.audio.status : 'ждёт звук видео') : 'Не запущена', name: 'audio' },
+        { title: 'По английским субтитрам', subtitle: 'Выровнять файл: частота кадров и сдвиг', name: 'auto' },
+        { title: 'По фразе', subtitle: 'Выберите реплику, которая звучит сейчас', name: 'phrase' },
+        { title: 'Сдвиг', subtitle: app.syncTitle(), name: 'shift' },
+        { title: 'Частота кадров видео', subtitle: 'Если субтитры уползают всё дальше', name: 'fps' },
+        { title: 'Сбросить для этого источника', subtitle: 'Убрать поправки под это видео', name: 'reset' }
+      ],
+      onBack: back,
+      onSelect: function (a) {
+        if (a.name === 'phrase') return app.calibrationMenu(track, reopen, root);
+
+        if (a.name === 'dur') {
+          var on = app.flag('durationsync', true);
+          Lampa.Storage.set('opensubs_durationsync', on ? 'false' : 'true');
+          if (!on && app.session) { app.session.durDone = false; app.session.durWait = []; app.durationSync(); }
+          return reopen();
+        }
+
+        if (a.name === 'audio') {
+          Lampa.Storage.set('opensubs_audiosync', aud ? 'false' : 'true');
+          if (aud) app.audioStop();
+          else app.audioStart();
+          return reopen();
+        }
+
+        if (a.name === 'auto') {
+          Lampa.Noty.show('Сравниваю с английскими субтитрами…');
+          app.autoSync(track, function (res, reason) {
+            Lampa.Noty.show(res ? 'Выровнено: ' + app.describeAuto(res) : 'Не получилось: ' + reason);
+          });
+          return root();
+        }
+
+        if (a.name === 'shift') {
+          app.closeSelects();
+          return Lampa.Select.show({
+            title: 'Сдвиг: ' + app.syncTitle(),
+            nohide: true,
+            items: app.STEPS.map(function (x) {
+              return { title: (x > 0 ? 'Позже на ' : 'Раньше на ') + Math.abs(x) + ' сек.', value: x };
+            }),
+            onBack: reopen,
+            onSelect: function (b) {
+              v.offset += b.value;
+              v.manual = true;
+              v.anchors = [];
+              app.setVideoSync(v);
+              app.learnResidual();
+              app.resyncAll();
+              reopen();
+            }
+          });
+        }
+
+        if (a.name === 'fps') {
+          app.closeSelects();
+          return Lampa.Select.show({
+            title: 'Частота кадров видео',
+            nohide: true,
+            items: app.FPS.map(function (f) {
+              return { title: f.title, scale: f.scale, selected: Math.abs(f.scale - v.scale) < 0.0005 };
+            }),
+            onBack: reopen,
+            onSelect: function (b) {
+              var t = app.videoTime(); // текущий момент остаётся на месте, меняется только скорость
+              var o = (t - v.offset) / v.scale;
+              v.scale = b.scale;
+              v.offset = t - o * b.scale;
+              v.manual = true;
+              v.anchors = [];
+              app.setVideoSync(v);
+              app.resyncAll();
+              reopen();
+            }
+          });
+        }
+
+        if (a.name === 'reset') {
+          app.setVideoSync({ scale: 1, offset: 0, anchors: [] });
+          if (app.session) { app.session.vsync = null; app.session.durDone = false; app.session.durWait = []; }
+          app.resyncAll();
+          app.durationSync();
+          if (app.audio) { app.audio.samples = []; app.audio.told = false; }
+          Lampa.Noty.show('Поправки для этого источника сброшены');
+          return reopen();
+        }
+      }
+    });
+  };
+
+
+  // Калибровка (calibration/checkpoints.js): 3 реплики вокруг текущего момента по текущей модели,
+  // «ни одна не подходит» — следующие 3, «уже совпадают» — текущая модель становится ручной.
+  app.calibrationMenu = function calibrationMenu(track, reopen, root, page, at, wasPlaying) {
+    var text = app.texts[track.os_id] || '';
+    var cues = subtitle.parse(text);
+    if (!cues.length) {
+      Lampa.Noty.show('Не удалось прочитать файл субтитров');
+      return reopen();
+    }
+    page = page || 0;
+    var vid = null;
+    try { vid = Lampa.PlayerVideo.video(); } catch (e) {}
+    if (typeof at !== 'number') {
+      at = app.videoTime();
+      wasPlaying = vid && !vid.paused;
+      if (wasPlaying) try { vid.pause(); } catch (e) {}
+    }
+    var resume = function () {
+      if (wasPlaying) try { vid.play(); } catch (e) {}
+    };
+    var toPlayer = app.cueFn(track.os_id);
+    var f = app.fileSync(track.os_id);
+    var toRef = function (ms) { return ms * f.scale + f.offset * 1000; };
+    var ch = calibration.choices(cues, toPlayer, at * 1000, page);
+    var items = ch.items.map(function (x) {
+      return { title: x.text.length > 90 ? x.text.slice(0, 90) + '…' : x.text, subtitle: app.fmtTime(x.playerMs / 1000).slice(0, 8), cue: cues[x.index] };
+    });
+    if (ch.more) items.push({ title: 'Ни одна не подходит', subtitle: 'Показать другие реплики', act: 'more' });
+    items.push({ title: 'Субтитры уже совпадают', subtitle: 'Запомнить текущую синхронизацию', act: 'ok' });
+    items.push({ title: 'Полный список реплик', act: 'list' });
+
+    app.closeSelects();
+    Lampa.Select.show({
+      title: 'Какая фраза звучит сейчас?',
+      nohide: true,
+      items: items,
+      onBack: function () {
+        resume();
+        reopen();
+      },
+      onSelect: function (b) {
+        if (b.act === 'more') return app.calibrationMenu(track, reopen, root, page + 1, at, wasPlaying);
+        if (b.act === 'list') return app.phraseMenu(track, reopen, root, at, wasPlaying);
+        var s = app.session;
+        if (b.act === 'ok') {
+          var v0 = app.videoSync();
+          app.addAnchor((at - v0.offset) / v0.scale, at, 'phrase');
+          Lampa.Noty.show('Синхронизация запомнена');
+        } else {
+          var before = app.videoSync().offset;
+          var pt = calibration.point(b.cue, toRef, at * 1000);
+          var v = app.addAnchor(pt.o, pt.t, 'phrase');
+          var next = calibration.nextPrompt(before * 1000, v.offset * 1000, s && s.model ? s.model['class'] : 'constant', at * 1000);
+          if (s) s.secondAt = next;
+          Lampa.Noty.show(next ? 'Сдвиг подобран. Через 10 минут предложу проверить ещё раз' : 'Сдвиг подобран');
+        }
+        if (s) s.calibrate = false;
+        if (!app.isShowing()) {
+          app.setCc(true);
+          app.showTrack(track);
+        }
+        resume();
+        root();
+      }
+    });
+  };
+
+
+  // вторая точка калибровки: подсказка, а не диалог посреди сцены
+  app.checkSecondPrompt = function checkSecondPrompt() {
+    var s = app.session;
+    if (!s || !s.secondAt || !app.isShowing()) return;
+    if (app.videoTime() * 1000 < s.secondAt) return;
+    s.secondAt = null;
+    app.notify('Проверьте синхронизацию: Субтитры → Синхронизация → По фразе');
+  };
+
+  app.phraseMenu = function phraseMenu(track, reopen, root, atGiven, playingGiven) {
+    var cues = app.parseCues(app.texts[track.os_id] || '');
+    if (!cues.length) {
+      Lampa.Noty.show('Не удалось прочитать файл субтитров');
+      return reopen();
+    }
+    var c = app.composed(track.os_id);
+    var at = typeof atGiven === 'number' ? atGiven : app.videoTime();
+    var vid = null;
+    try { vid = Lampa.PlayerVideo.video(); } catch (e) {}
+    var wasPlaying = typeof atGiven === 'number' ? playingGiven : vid && !vid.paused;
+    if (wasPlaying && typeof atGiven !== 'number') try { vid.pause(); } catch (e) {}
+    var resume = function () {
+      if (wasPlaying) try { vid.play(); } catch (e) {}
+    };
+
+    var near = 0;
+    for (var i = 0; i < cues.length; i++) if (cues[i].start * c.scale + c.offset <= at) near = i;
+    var from = Math.max(0, near - 25);
+    var to = Math.min(cues.length, near + 15);
+    var items = [];
+    for (var j = from; j < to; j++) {
+      var tt = cues[j].start * c.scale + c.offset;
+      items.push({
+        title: cues[j].text.length > 90 ? cues[j].text.slice(0, 90) + '…' : cues[j].text,
+        subtitle: app.fmtTime(tt).slice(0, 8),
+        cue: cues[j],
+        selected: j === near
+      });
+    }
+
+    app.closeSelects();
+    Lampa.Select.show({
+      title: 'Какая фраза звучит сейчас?',
+      nohide: true,
+      items: items,
+      onBack: function () {
+        resume();
+        reopen();
+      },
+      onSelect: function (b) {
+        var both = app.anchorPhrase(track, b.cue, at);
+        Lampa.Noty.show(both ? 'Сдвиг и скорость подобраны' : 'Сдвиг подобран. Для точности повторите через 10+ минут');
+        resume();
+        root();
+      }
+    });
+  };
+
+
+  // ---------- кнопка субтитров в плеере ----------
+  app.SIZES = [
+    { value: 'auto', title: 'Как в Lampa' },
+    { value: 's', title: 'Маленький', em: 1.6 },
+    { value: 'm', title: 'Средний', em: 2 },
+    { value: 'l', title: 'Обычный', em: 2.5 },
+    { value: 'xl', title: 'Крупный', em: 3 },
+    { value: 'xxl', title: 'Очень крупный', em: 3.6 }
+  ];
+
+  app.SHADOWS = [
+    { value: 'auto', title: 'Как в Lampa' },
+    { value: 'none', title: 'Без тени' },
+    { value: 'soft', title: 'Мягкая тень' },
+    { value: 'outline', title: 'Обводка' },
+    { value: 'backdrop', title: 'Тёмная подложка' }
+  ];
+
+  app.titleOf = function titleOf(list, value) {
+    for (var i = 0; i < list.length; i++) if (list[i].value === value) return list[i].title;
+    return list[0].title;
+  };
+
+
+  // Новая Lampa складывает селекты в стек; закрываем всё и рисуем меню заново, чтобы подписи были свежими
+  app.closeSelects = function closeSelects() {
+    if (Lampa.Select.closeAll) Lampa.Select.closeAll();
+    else Lampa.Select.close();
+  };
+
+
+  // дорожка для калибровки: показанная неподтверждённая или скрытая после неудачной проверки
+  app.calibTrack = function calibTrack() {
+    var s = app.session;
+    if (!s) return null;
+    var on = app.isShowing();
+    if (on && on.os_id && app.ui.decision && app.ui.decision.marker === 'unconfirmed' && !app.videoSync().manual) return on;
+    if (s.calibrate && s.bg) return app.findTrack(s.bg);
+    return null;
+  };
+
+  app.menu = function menu(back) {
+    var subs = app.trackList();
+    var on = null;
+    for (var i = 0; i < subs.length; i++) if (subs[i].selected || subs[i].mode === 'showing') { on = subs[i]; break; }
+
+    Lampa.Select.show({
+      title: 'Субтитры',
+      nohide: true,
+      items: [
+        { title: 'Язык субтитров', subtitle: (on ? (on.label || on.language || 'Дорожка') : 'Выключены') + (app.session && app.session.audio && app.setting('lang', 'audio') === 'audio' ? ' · озвучка: ' + app.langName(app.session.audio) : ''), name: 'lang' },
+        { title: 'Размер шрифта', subtitle: app.titleOf(app.SIZES, app.setting('size', 'auto')), name: 'size' },
+        { title: 'Тень шрифта', subtitle: app.titleOf(app.SHADOWS, app.setting('shadow', 'auto')), name: 'shadow' },
+        { title: 'Синхронизация', subtitle: on && on.os_id ? app.syncTitle() : 'Для субтитров OpenSubtitles', name: 'sync' }
+      ].concat(app.calibTrack() ? [{ title: 'Синхронизировать по фразе', subtitle: 'Синхронизация не подтверждена — выберите реплику, которая звучит', name: 'calib' }] : []),
+      onBack: back,
+      onSelect: function (a) {
+        var again = function () {
+          app.closeSelects();
+          app.menu(back);
+        };
+
+        if (a.name === 'calib') return app.calibrationMenu(app.calibTrack(), again, back);
+
+        if (a.name === 'lang') {
+          var items = [{ title: 'Выключены', selected: !on, act: 'off' }];
+          for (var j = 0; j < subs.length; j++) {
+            items.push({ title: subs[j].label || subs[j].language || ('Дорожка ' + (j + 1)), selected: subs[j] === on, track: subs[j] });
+          }
+          // найденные, но ещё не скачанные варианты OpenSubtitles
+          if (app.session) {
+            var order = app.langOrder(app.session);
+            for (var l = 0; l < order.length; l++) {
+              var cand = app.session.found[order[l]] || [];
+              for (var c = 0; c < cand.length; c++) {
+                if (app.findTrack(cand[c].files[0].file_id)) continue;
+                items.push({ title: app.trackLabel(cand[c]), subtitle: 'Скачать', cand: cand[c] });
+              }
+            }
+          }
+          if (items.length === 1) {
+            Lampa.Noty.show(!app.apiKey() ? 'OpenSubtitles: укажите API-ключ в настройках плагина' : app.session && app.session.searching ? 'Ищу субтитры…' : 'Субтитры для этого видео не найдены');
+            return again();
+          }
+          app.closeSelects();
+          return Lampa.Select.show({
+            title: 'Язык субтитров',
+            items: items,
+            nohide: true,
+            onBack: again,
+            onSelect: function (b) {
+              if (b.act === 'off') {
+                app.setCc(false);
+                app.turnOff();
+              } else if (b.track) {
+                app.setCc(true);
+                app.showTrack(b.track);
+                app.maybeAutoSync(b.track);
+              } else if (b.cand) {
+                app.setCc(true);
+                app.ensureTrack(b.cand, function (t) { app.showTrack(t); app.maybeAutoSync(t); }, function () {
+                  Lampa.Noty.show('Не удалось скачать субтитры');
+                });
+              }
+              back();
+            }
+          });
+        }
+
+        var list = a.name === 'size' ? app.SIZES : a.name === 'shadow' ? app.SHADOWS : null;
+        if (list) {
+          var cur = app.setting(a.name, 'auto');
+          app.closeSelects();
+          return Lampa.Select.show({
+            title: a.title,
+            items: list.map(function (o) { return { title: o.title, value: o.value, selected: o.value === cur }; }),
+            nohide: true,
+            onBack: again,
+            onSelect: function (b) {
+              Lampa.Storage.set('opensubs_' + a.name, b.value);
+              app.applyStyle();
+              again();
+            }
+          });
+        }
+
+        if (a.name === 'sync') {
+          if (!on || !on.os_id || !app.texts[on.os_id]) {
+            Lampa.Noty.show('Сначала включите субтитры OpenSubtitles');
+            return again();
+          }
+          return app.syncMenu(on, again, back);
+        }
+      }
+    });
+  };
+
+  app.openSettingsMenu = function openSettingsMenu() {
+    var back = function () {
+      app.closeSelects();
+      Lampa.Controller.toggle(Lampa.Platform.screen('mobile') ? 'player' : 'player_panel');
+    };
+    app.closeSelects();
+    app.menu(back);
+  };
+
+
+  // пункт «Субтитры» в настройках плеера (шестерёнка) открывает наше меню
+  app.hookPlayerSettings = function hookPlayerSettings() {
+    if (!Lampa.Select.listener) return;
+    Lampa.Select.listener.follow('preshow', function (e) {
+      var act = e && e.active;
+      if (!act || !act.items || act._opensubs) return;
+      if (!(Lampa.Player.opened && Lampa.Player.opened())) return;
+      var item = null;
+      for (var i = 0; i < act.items.length; i++) if (act.items[i] && act.items[i].method === 'subs') item = act.items[i];
+      if (!item) return;
+      act._opensubs = true;
+      var on = app.isShowing();
+      item.subtitle = on ? (on.label || 'Включены') : 'Выключены';
+      var orig = act.onSelect;
+      act.onSelect = function (a) {
+        if (a && a.method === 'subs') return app.openSettingsMenu();
+        return orig && orig.apply(this, arguments);
+      };
+    });
+  };
+};
   }
   };
 
