@@ -6,6 +6,74 @@
  */
 (function () {
   var defs = {
+  "analyzers/subtitle": function (module, exports, require) {
+/*
+ * Разбор субтитров (WebVTT/SRT) и пересчёт их таймингов. Время — мс (ADR 6).
+ *   parse(text)              → [{ startMs, endMs, text }]
+ *   starts(cues[, pieces])   → отсортированные начала реплик, при необходимости через модель
+ *   retime(text, pieces)     → тот же файл с пересчитанными таймингами (для плеера)
+ *   fromFixture(json)        → реплики из фикстуры тестов ([[startMs, endMs, chars]])
+ */
+'use strict';
+
+var time = require('../engine/time');
+
+var TIME_RX = /(?:(\d{1,3}):)?(\d{2}):(\d{2})[.,](\d{3})/g;
+
+function clockMs(h, m, s, ms) {
+  return ((parseInt(h || '0', 10) * 60 + parseInt(m, 10)) * 60 + parseInt(s, 10)) * 1000 + parseInt(ms, 10);
+}
+
+function parse(text) {
+  var out = [];
+  var blocks = String(text || '').replace(/\r/g, '').split(/\n\n+/);
+  for (var i = 0; i < blocks.length; i++) {
+    var lines = blocks[i].split('\n');
+    for (var j = 0; j < lines.length; j++) {
+      if (lines[j].indexOf('-->') < 0) continue;
+      TIME_RX.lastIndex = 0;
+      var a = TIME_RX.exec(lines[j]);
+      var b = a && TIME_RX.exec(lines[j]);
+      if (!a) break;
+      var body = lines.slice(j + 1).join(' ').replace(/<[^>]+>|\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim();
+      var st = clockMs(a[1], a[2], a[3], a[4]);
+      if (body) out.push({ startMs: st, endMs: b ? clockMs(b[1], b[2], b[3], b[4]) : st + 2000, text: body });
+      break;
+    }
+  }
+  return out;
+}
+
+function starts(cues, pieces) {
+  var out = [];
+  for (var i = 0; i < cues.length; i++) out.push(pieces ? time.apply(pieces, cues[i].startMs) : cues[i].startMs);
+  return out.sort(function (a, b) { return a - b; });
+}
+
+function isIdentity(pieces) {
+  if (!pieces || !pieces.length) return true;
+  for (var i = 0; i < pieces.length; i++) {
+    if (Math.abs(pieces[i].scale - 1) > 1e-9 || pieces[i].offsetMs) return false;
+  }
+  return true;
+}
+
+function retime(text, pieces) {
+  if (isIdentity(pieces)) return text;
+  return String(text).replace(/^.*-->.*$/gm, function (line) {
+    return line.replace(TIME_RX, function (all, h, m, s, ms) {
+      return time.formatClock(time.apply(pieces, clockMs(h, m, s, ms)));
+    });
+  });
+}
+
+function fromFixture(json) {
+  return json.cues.map(function (c) { return { startMs: c[0], endMs: c[1], text: '' }; });
+}
+
+module.exports = { parse: parse, starts: starts, retime: retime, isIdentity: isIdentity, fromFixture: fromFixture };
+  },
+
   "api/http": function (module, exports, require) {
 /*
  * HTTP для браузера (XMLHttpRequest). Модули получают его через create({ http }),
@@ -731,6 +799,230 @@ module.exports = {
 };
   },
 
+  "estimators/cross-subs": function (module, exports, require) {
+/*
+ * Оценщик crossSubs: приводит файл субтитров к эталонному (обычно английские того же релиза или того,
+ * что показывает видео). Реплики одного фильма на разных языках начинаются почти в одни моменты:
+ * для каждого допустимого масштаба строим гистограмму разниц «эталон − перевод», пик даёт сдвиг,
+ * его высота — качество совпадения. Текст реплик не нужен — только ритм.
+ *
+ * match(refStartsMs, tgtStartsMs) → { scale, offsetMs, score, ratio, matched, madMs } | null
+ * estimate(refStartsMs, tgtStartsMs) → { ok, hypothesis, result, reason }
+ *   hypothesis.estimator = 'crossSubs'; модель переводит время субтитров в шкалу эталона.
+ */
+'use strict';
+
+var types = require('../engine/types');
+var time = require('../engine/time');
+
+var FILM = time.FPS.FILM;
+// Допустимые пересчёты частоты кадров. 24 ↔ 23.976 оставлен: здесь его видно по наклону, а не по метке.
+var SCALES = [1, 25 / FILM, FILM / 25, 24 / FILM, FILM / 24, 25 / 24, 24 / 25];
+
+var BIN_MS = 200;
+var WIN_MS = 300000;   // ищем сдвиг в пределах ±5 минут
+var FINE_MS = 400;     // точная подгонка — разницы в пределах ±0.4 с от пика
+var MIN_SCORE = 40;
+var MIN_RATIO = 0.3;
+
+function match(ref, tgt) {
+  var best = null;
+  for (var si = 0; si < SCALES.length; si++) {
+    var sc = SCALES[si];
+    var hist = {};
+    var lo = 0;
+    for (var i = 0; i < tgt.length; i++) {
+      var x = tgt[i] * sc;
+      while (lo < ref.length && ref[lo] < x - WIN_MS) lo++;
+      for (var j = lo; j < ref.length && ref[j] <= x + WIN_MS; j++) {
+        var k = Math.round((ref[j] - x) / BIN_MS);
+        hist[k] = (hist[k] || 0) + 1;
+      }
+    }
+    for (var key in hist) {
+      var kk = parseInt(key, 10);
+      var score = hist[kk] + (hist[kk - 1] || 0) + (hist[kk + 1] || 0);
+      if (!best || score > best.score) best = { scale: sc, k: kk, score: score };
+    }
+  }
+  if (!best) return null;
+
+  var center = best.k * BIN_MS;
+  var ds = [];
+  var lo2 = 0;
+  for (var a = 0; a < tgt.length; a++) {
+    var y = tgt[a] * best.scale;
+    while (lo2 < ref.length && ref[lo2] < y + center - FINE_MS - 100) lo2++;
+    for (var b = lo2; b < ref.length && ref[b] <= y + center + FINE_MS + 100; b++) {
+      var d = ref[b] - y;
+      if (Math.abs(d - center) <= FINE_MS) ds.push(d);
+    }
+  }
+  ds.sort(function (p, q) { return p - q; });
+  var offset = ds.length ? ds[Math.floor(ds.length / 2)] : center;
+  var dev = ds.map(function (d) { return Math.abs(d - offset); }).sort(function (p, q) { return p - q; });
+  return {
+    scale: best.scale,
+    offsetMs: Math.round(offset),
+    score: best.score,
+    ratio: best.score / Math.max(1, Math.min(ref.length, tgt.length)),
+    matched: ds.length,
+    madMs: dev.length ? Math.round(dev[Math.floor(dev.length / 2)]) : null
+  };
+}
+
+function scaleName(scale) {
+  var names = [[25 / FILM, '25 → 23.976'], [FILM / 25, '23.976 → 25'], [24 / FILM, '24 → 23.976'], [FILM / 24, '23.976 → 24'],
+    [25 / 24, '25 → 24'], [24 / 25, '24 → 25']];
+  for (var i = 0; i < names.length; i++) if (Math.abs(names[i][0] - scale) < 1e-6) return names[i][1];
+  return '';
+}
+
+// Уверенность из доказательств (ADR 2): доля совпавших реплик и разброс разниц.
+function confidence(r) {
+  var c = Math.min(1, (r.ratio - MIN_RATIO) / 0.5) * 0.7 + 0.2;
+  if (r.madMs !== null && r.madMs > 150) c -= 0.1;
+  return Math.max(0.05, Math.min(0.9, c));
+}
+
+function estimate(ref, tgt, labels) {
+  labels = labels || {};
+  if (!ref.length || !tgt.length) return { ok: false, reason: 'нет реплик' };
+  var r = match(ref, tgt);
+  if (!r || r.score < MIN_SCORE || r.ratio < MIN_RATIO) return { ok: false, result: r, reason: 'файлы слишком разные' };
+  var h = types.hypothesis({
+    estimator: 'crossSubs',
+    kind: Math.abs(r.scale - 1) > 1e-9 ? 'drift' : 'offset',
+    offsetMs: r.offsetMs,
+    scale: r.scale,
+    sigmaMs: Math.max(100, r.madMs || 0),
+    confidence: confidence(r),
+    evidence: [
+      { what: 'совпало реплик', value: r.score, source: labels.ref || 'эталон' },
+      { what: 'доля совпадения', value: Math.round(r.ratio * 100) / 100, source: labels.tgt || 'субтитры' },
+      { what: 'пересчёт кадров', value: scaleName(r.scale) || 'нет', source: 'crossSubs' }
+    ]
+  });
+  return { ok: true, hypothesis: h, result: r };
+}
+
+module.exports = { SCALES: SCALES, MIN_SCORE: MIN_SCORE, MIN_RATIO: MIN_RATIO, match: match, estimate: estimate, scaleName: scaleName };
+  },
+
+  "estimators/duration": function (module, exports, require) {
+/*
+ * Оценщик duration: гипотезы, которые даёт сравнение длительностей с оригиналом
+ * (совпадает / почти совпадает / пересчёт частоты кадров). Вставку в начале выдаёт
+ * отдельный оценщик openingInsertion (ADR 3). Расчёт — engine/diagnostics.js.
+ */
+'use strict';
+
+function estimate(release) {
+  var hs = (release && release.hypotheses) || [];
+  var out = [];
+  for (var i = 0; i < hs.length; i++) if (hs[i].estimator === 'duration') out.push(hs[i]);
+  return out;
+}
+
+module.exports = { estimate: estimate };
+  },
+
+  "estimators/fps": function (module, exports, require) {
+/*
+ * Оценщик fps: частота кадров субтитров против частоты кадров видео.
+ * Надёжно различаются только PAL 25 и «плёночные» 24/23.976: метка 24 vs 23.976 врёт
+ * (Phantom пишет 24.000 там, где HDRezka 23.974 при одинаковой длительности), поэтому
+ * пересчёт 24 ↔ 23.976 этот оценщик не предлагает — его видно только по наклону crossSubs.
+ *
+ * estimate({ subsFps, videoFpsDeclared, videoFpsMeasured }) → { scale, hypothesis | null, reason }
+ * ADR правило 5: пересчёт verified, когда расхождение подтверждено двумя признаками.
+ */
+'use strict';
+
+var types = require('../engine/types');
+var time = require('../engine/time');
+
+function family(f) {
+  if (!f) return null;
+  if (Math.abs(f - 25) < 0.1) return 'pal';
+  if (Math.abs(f - 23.976) < 0.1 || Math.abs(f - 24) < 0.1) return 'film';
+  return null;
+}
+
+var RATE = { pal: time.FPS.PAL, film: time.FPS.FILM };
+
+function estimate(o) {
+  o = o || {};
+  var sub = family(o.subsFps);
+  var declared = family(o.videoFpsDeclared);
+  var measured = family(o.videoFpsMeasured);
+  var video = measured || declared;
+  if (!sub) return { scale: 1, hypothesis: null, reason: 'частота субтитров неизвестна' };
+  if (!video) return { scale: 1, hypothesis: null, reason: 'частота видео неизвестна' };
+  if (sub === video) return { scale: 1, hypothesis: null, reason: 'частоты совпадают' };
+  if (measured && declared && measured !== declared) return { scale: 1, hypothesis: null, reason: 'метка и замер FPS видео расходятся' };
+
+  var scale = time.fpsRatio(RATE[sub], RATE[video]);
+  var signs = (declared ? 1 : 0) + (measured ? 1 : 0);
+  var evidence = [{ what: 'FPS субтитров', value: o.subsFps, source: 'opensubtitles' }];
+  if (declared) evidence.push({ what: 'FPS видео (метка)', value: o.videoFpsDeclared, source: 'hls' });
+  if (measured) evidence.push({ what: 'FPS видео (замер)', value: Math.round(o.videoFpsMeasured * 100) / 100, source: 'player' });
+  return {
+    scale: scale,
+    reason: 'субтитры ' + o.subsFps + ' к/с, видео ' + (o.videoFpsMeasured ? o.videoFpsMeasured.toFixed(2) : o.videoFpsDeclared),
+    hypothesis: types.hypothesis({
+      estimator: 'fps',
+      kind: 'drift',
+      offsetMs: 0,
+      scale: scale,
+      sigmaMs: 1000,
+      confidence: signs >= 2 ? 0.8 : 0.5,
+      evidence: evidence
+    })
+  };
+}
+
+module.exports = { estimate: estimate, family: family };
+  },
+
+  "estimators/opening-insertion": function (module, exports, require) {
+/*
+ * Оценщик openingInsertion (ADR 3): duration_delta → opening_insertion_candidate → opening_insertion_confirmed.
+ *   candidate(release)            — кандидат из ReleaseDiagnostics (или null);
+ *   confirm(candidate, evidenceH) — подтверждение независимой гипотезой (звук, контрольная точка)
+ *                                   в пределах CONFIRM_MS; иначе null.
+ * Подтверждение даёт только независимое доказательство, а не время просмотра.
+ */
+'use strict';
+
+var types = require('../engine/types');
+
+var CONFIRM_MS = 1000;
+var INDEPENDENT = { audio: true, checkpoint: true };
+
+function candidate(release) {
+  var hs = (release && release.hypotheses) || [];
+  for (var i = 0; i < hs.length; i++) if (hs[i].kind === 'opening_insertion_candidate') return hs[i];
+  return null;
+}
+
+function confirm(cand, h) {
+  if (!cand || !h || !INDEPENDENT[h.estimator]) return null;
+  if (Math.abs(h.scale - 1) > 0.0005) return null;
+  if (Math.abs(h.offsetMs - cand.offsetMs) > CONFIRM_MS) return null;
+  return types.hypothesis({
+    estimator: 'openingInsertion',
+    kind: 'opening_insertion_confirmed',
+    offsetMs: h.offsetMs,
+    sigmaMs: Math.min(h.sigmaMs, CONFIRM_MS),
+    confidence: Math.min(0.95, Math.max(cand.confidence, h.confidence) + 0.2),
+    evidence: cand.evidence.concat([{ what: 'подтверждено', value: h.offsetMs, source: h.estimator }])
+  });
+}
+
+module.exports = { CONFIRM_MS: CONFIRM_MS, candidate: candidate, confirm: confirm };
+  },
+
   "index": function (module, exports, require) {
 /*
  * Точка входа плагина OpenSubs.
@@ -772,6 +1064,10 @@ require('./legacy/plugin');
   var lampacApi = require('../api/lampac').create({ http: http, cache: { get: odurGet, set: odurSet } });
   var clientProbe = require('../probe/client-probe').create({ http: http });
   var diagnostics = require('../engine/diagnostics');
+  var time = require('../engine/time');
+  var subtitle = require('../analyzers/subtitle');
+  var crossSubs = require('../estimators/cross-subs');
+  var fpsEstimator = require('../estimators/fps');
 
   function log() {
     try {
@@ -1522,50 +1818,18 @@ require('./legacy/plugin');
     return { scale: f.scale * v.scale, offset: f.offset * v.scale + v.offset };
   }
 
-  function parseTime(h, m, sec, ms) {
-    return (parseInt(h || '0', 10) * 3600) + parseInt(m, 10) * 60 + parseInt(sec, 10) + parseInt(ms, 10) / 1000;
+  // Разбор и пересчёт таймингов — analyzers/subtitle.js (мс); здесь — переходники на секунды прототипа.
+  function applySync(text, sync) {
+    return subtitle.retime(text, time.linear(sync.scale, sync.offset * 1000));
   }
 
   function fmtTime(t) {
-    if (t < 0) t = 0;
-    var ms = Math.round(t * 1000);
-    var h = Math.floor(ms / 3600000); ms -= h * 3600000;
-    var m = Math.floor(ms / 60000); ms -= m * 60000;
-    var sec = Math.floor(ms / 1000); ms -= sec * 1000;
-    var p = function (n, l) { n = String(n); while (n.length < l) n = '0' + n; return n; };
-    return p(h, 2) + ':' + p(m, 2) + ':' + p(sec, 2) + '.' + p(ms, 3);
+    return time.formatClock(t * 1000);
   }
 
-  var TIME_RX = /(?:(\d{1,2}):)?(\d{2}):(\d{2})[.,](\d{3})/g;
-
-  function applySync(text, sync) {
-    if (Math.abs(sync.scale - 1) < 1e-9 && Math.abs(sync.offset) < 0.0005) return text;
-    return text.replace(/^.*-->.*$/gm, function (line) {
-      return line.replace(TIME_RX, function (all, h, m, sec, ms) {
-        return fmtTime(parseTime(h, m, sec, ms) * sync.scale + sync.offset);
-      });
-    });
-  }
-
-  // реплики файла: [{start, end, text}]
+  // реплики файла: [{start, end, text}] в секундах
   function parseCues(text) {
-    var out = [];
-    var blocks = String(text).replace(/\r/g, '').split(/\n\n+/);
-    for (var i = 0; i < blocks.length; i++) {
-      var lines = blocks[i].split('\n');
-      for (var j = 0; j < lines.length; j++) {
-        if (lines[j].indexOf('-->') < 0) continue;
-        TIME_RX.lastIndex = 0;
-        var m1 = TIME_RX.exec(lines[j]);
-        var m2 = m1 && TIME_RX.exec(lines[j]);
-        if (!m1) break;
-        var body = lines.slice(j + 1).join(' ').replace(/<[^>]+>|\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim();
-        var st = parseTime(m1[1], m1[2], m1[3], m1[4]);
-        if (body) out.push({ start: st, end: m2 ? parseTime(m2[1], m2[2], m2[3], m2[4]) : st + 2, text: body });
-        break;
-      }
-    }
-    return out;
+    return subtitle.parse(text).map(function (c) { return { start: c.startMs / 1000, end: c.endMs / 1000, text: c.text }; });
   }
 
   // пересобрать файлы всех дорожек OpenSubtitles с текущими поправками, выбранную оставить включённой
@@ -1654,52 +1918,9 @@ require('./legacy/plugin');
   // Реплики одного фильма на разных языках начинаются почти в одни моменты. Перебираем пересчёты частоты кадров
   // и для каждого строим гистограмму разниц «эталон − перевод»: пик даёт сдвиг, высота пика — качество совпадения.
 
-  var SCALES = [1, 25 / 23.976, 23.976 / 25, 24 / 23.976, 23.976 / 24, 25 / 24, 24 / 25];
-
-  function cueStarts(text, sync) {
-    var c = parseCues(text);
-    var out = [];
-    for (var i = 0; i < c.length; i++) out.push(sync ? c[i].start * sync.scale + sync.offset : c[i].start);
-    return out.sort(function (a, b) { return a - b; });
-  }
-
-  function matchTimings(ref, tgt) {
-    var BIN = 0.2, WIN = 300;
-    var best = null;
-    for (var si = 0; si < SCALES.length; si++) {
-      var sc = SCALES[si];
-      var hist = {};
-      var lo = 0;
-      for (var i = 0; i < tgt.length; i++) {
-        var x = tgt[i] * sc;
-        while (lo < ref.length && ref[lo] < x - WIN) lo++;
-        for (var j = lo; j < ref.length && ref[j] <= x + WIN; j++) {
-          var k = Math.round((ref[j] - x) / BIN);
-          hist[k] = (hist[k] || 0) + 1;
-        }
-      }
-      for (var key in hist) {
-        var kk = parseInt(key, 10);
-        var score = hist[kk] + (hist[kk - 1] || 0) + (hist[kk + 1] || 0);
-        if (!best || score > best.score) best = { scale: sc, k: kk, score: score };
-      }
-    }
-    if (!best) return null;
-
-    var ds = [];
-    var lo2 = 0;
-    for (var a = 0; a < tgt.length; a++) {
-      var y = tgt[a] * best.scale;
-      while (lo2 < ref.length && ref[lo2] < y + best.k * BIN - 0.5) lo2++;
-      for (var b = lo2; b < ref.length && ref[b] <= y + best.k * BIN + 0.5; b++) {
-        var d = ref[b] - y;
-        if (Math.abs(d - best.k * BIN) <= 0.4) ds.push(d);
-      }
-    }
-    ds.sort(function (p, q) { return p - q; });
-    best.offset = ds.length ? ds[Math.floor(ds.length / 2)] : best.k * BIN;
-    best.ratio = best.score / Math.max(1, Math.min(ref.length, tgt.length));
-    return best;
+  // Расчёт — estimators/cross-subs.js; sync файла в секундах прототипа.
+  function cueStartsMs(text, sync) {
+    return subtitle.starts(subtitle.parse(text), sync ? time.linear(sync.scale, sync.offset * 1000) : null);
   }
 
   // done(result|null, reason)
@@ -1716,8 +1937,9 @@ require('./legacy/plugin');
       if (!text) return done(null, 'не удалось скачать английские');
       texts[rid] = texts[rid] || text;
       setTimeout(function () {
-        var res = matchTimings(cueStarts(text, fileSync(rid)), cueStarts(texts[fid]));
-        if (!res || res.score < 40 || res.ratio < 0.3) return done(null, 'файлы слишком разные');
+        var est = crossSubs.estimate(cueStartsMs(text, fileSync(rid)), cueStartsMs(texts[fid]));
+        if (!est.ok) return done(null, est.reason);
+        var res = { scale: est.result.scale, offset: est.result.offsetMs / 1000, score: est.result.score, ratio: est.result.ratio };
         setFileSync(fid, { scale: res.scale, offset: res.offset });
         resyncAll();
         done(res);
@@ -1819,14 +2041,9 @@ require('./legacy/plugin');
     tick();
   }
 
-  function isPal(f) { return Math.abs(f - 25) < 0.1; }
-  function isFilm(f) { return Math.abs(f - 23.976) < 0.1 || Math.abs(f - 24) < 0.1; }
-
-  // субтитры (эталон) и видео в разной системе кадров: 25 (PAL, ускоренное) против 23.976/24 → пересчёт скорости
+  // субтитры (эталон) и видео в разной системе кадров: 25 (PAL) против 23.976/24 → estimators/fps.js
   function palScale(subFps, vidFps) {
-    if (!subFps || !vidFps) return 1;
-    if ((isPal(subFps) && isFilm(vidFps)) || (isFilm(subFps) && isPal(vidFps))) return (isPal(subFps) ? 25 : 23.976) / (isPal(vidFps) ? 25 : 23.976);
-    return 1;
+    return fpsEstimator.estimate({ subsFps: subFps, videoFpsDeclared: vidFps }).scale;
   }
 
   function isMovie(s) {
