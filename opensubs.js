@@ -12,6 +12,8 @@
  *   parse(text)              → [{ startMs, endMs, text }]
  *   starts(cues[, pieces])   → отсортированные начала реплик, при необходимости через модель
  *   retime(text, pieces)     → тот же файл с пересчитанными таймингами (для плеера)
+ *   retimeFn(text, fn)       → то же с произвольной функцией мс → мс (композиция моделей)
+ *   build(cues)              → WebVTT из реплик (raw — исходные строки текста с разметкой)
  *   fromFixture(json)        → реплики из фикстуры тестов ([[startMs, endMs, chars]])
  */
 'use strict';
@@ -37,7 +39,8 @@ function parse(text) {
       if (!a) break;
       var body = lines.slice(j + 1).join(' ').replace(/<[^>]+>|\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim();
       var st = clockMs(a[1], a[2], a[3], a[4]);
-      if (body) out.push({ startMs: st, endMs: b ? clockMs(b[1], b[2], b[3], b[4]) : st + 2000, text: body });
+      var raw = lines.slice(j + 1).join('\n').replace(/^\s+|\s+$/g, '');
+      if (body) out.push({ startMs: st, endMs: b ? clockMs(b[1], b[2], b[3], b[4]) : st + 2000, text: body, raw: raw });
       break;
     }
   }
@@ -58,20 +61,34 @@ function isIdentity(pieces) {
   return true;
 }
 
-function retime(text, pieces) {
-  if (isIdentity(pieces)) return text;
+function retimeFn(text, fn) {
   return String(text).replace(/^.*-->.*$/gm, function (line) {
     return line.replace(TIME_RX, function (all, h, m, s, ms) {
-      return time.formatClock(time.apply(pieces, clockMs(h, m, s, ms)));
+      return time.formatClock(fn(clockMs(h, m, s, ms)));
     });
   });
+}
+
+function retime(text, pieces) {
+  if (isIdentity(pieces)) return text;
+  return retimeFn(text, function (ms) { return time.apply(pieces, ms); });
+}
+
+function build(cues) {
+  var out = ['WEBVTT', ''];
+  for (var i = 0; i < cues.length; i++) {
+    out.push(time.formatClock(cues[i].startMs) + ' --> ' + time.formatClock(cues[i].endMs));
+    out.push(cues[i].raw || cues[i].text);
+    out.push('');
+  }
+  return out.join('\n');
 }
 
 function fromFixture(json) {
   return json.cues.map(function (c) { return { startMs: c[0], endMs: c[1], text: '' }; });
 }
 
-module.exports = { parse: parse, starts: starts, retime: retime, isIdentity: isIdentity, fromFixture: fromFixture };
+module.exports = { parse: parse, starts: starts, retime: retime, retimeFn: retimeFn, build: build, isIdentity: isIdentity, fromFixture: fromFixture };
   },
 
   "api/http": function (module, exports, require) {
@@ -327,6 +344,49 @@ module.exports = {
 };
   },
 
+  "engine/decider": function (module, exports, require) {
+/*
+ * Decider — что делать с субтитрами при данной модели (таблица правил документа, ADR 3 вариант А).
+ *
+ * decide(model, { movie, canListen, release }) → {
+ *   action:    'show' | 'wait' | 'hide',
+ *   marker:    'unconfirmed' | null,   // признак неподтверждённой синхронизации на иконке CC
+ *   listen:    boolean,                // запустить или продолжать проверку по звуку
+ *   calibrate: boolean,                // предложить калибровку пользователем
+ *   rule:      номер правила таблицы, reason: текст для меню
+ * }
+ */
+'use strict';
+
+function decide(model, ctx) {
+  ctx = ctx || {};
+  var status = model ? model.status : 'failed';
+  var structural = ctx.release && ctx.release.modelClass === 'structural';
+  var listen = !!ctx.canListen && !ctx.movie;
+
+  if (status === 'verified') {
+    return { action: 'show', marker: null, listen: false, calibrate: false, rule: 1, reason: 'синхронизация подтверждена' };
+  }
+  if (status === 'estimated') {
+    // правило 3 (вариант А): показываем сразу с признаком, звук уточняет в фоне
+    return { action: 'show', marker: 'unconfirmed', listen: listen, calibrate: !listen, rule: 3, reason: 'предварительная поправка, не подтверждена' };
+  }
+  if (ctx.movie && status === 'failed') {
+    // правило 4: у фильма нет оригинала для сравнения — субтитры от релиза, звук не слушаем
+    return { action: 'show', marker: 'unconfirmed', listen: false, calibrate: true, rule: 4, reason: 'фильм: без сверки с видео' };
+  }
+  if (status === 'uncertain' || structural) {
+    if (listen) return { action: 'wait', marker: null, listen: true, calibrate: false, rule: structural ? 6 : 7, reason: 'ждёт подтверждения по звуку' };
+    return { action: 'hide', marker: null, listen: false, calibrate: true, rule: 6, reason: 'нет уверенности — нужна калибровка' };
+  }
+  // failed: оригинала нет
+  if (listen) return { action: 'wait', marker: null, listen: true, calibrate: false, rule: 7, reason: 'оригинала нет, проверка по звуку' };
+  return { action: 'hide', marker: null, listen: false, calibrate: true, rule: 8, reason: 'синхронизация не найдена' };
+}
+
+module.exports = { decide: decide };
+  },
+
   "engine/diagnostics": function (module, exports, require) {
 /*
  * ReleaseDiagnostics — этап 1 конвейера: чем это видео отличается от оригинала той же серии.
@@ -439,7 +499,7 @@ function diagnose(input) {
   } else if (abs(delta) <= sameMs) {
     out.cls = 'same';
     out.modelClass = 'constant';
-    conf = Math.min(0.95, 0.6 + 0.15 * (agree - 1 + sameSiblings));
+    conf = Math.min(0.95, 0.65 + 0.15 * (agree - 1 + sameSiblings));
     if (input.exact === false) conf -= 0.2;
     out.hypotheses.push(types.hypothesis({ estimator: 'duration', kind: 'offset', offsetMs: 0, sigmaMs: sameMs, confidence: conf, evidence: evidence }));
     out.text = 'совпадает с оригиналом (' + nearest.source + '), вставки нет';
@@ -468,6 +528,308 @@ function diagnose(input) {
 }
 
 module.exports = { diagnose: diagnose, LIMITS: LIMITS };
+  },
+
+  "engine/events": function (module, exports, require) {
+/*
+ * Engine.events — события движка для UI (иконка CC, меню синхронизации).
+ *   'state'    { state: 'idle' | 'searching' | 'diagnosing' | 'listening' | 'ready' }
+ *   'progress' { value: 0..1 }        — прогресс фоновой проверки по звуку
+ *   'model'    SyncModel              — новая модель (после любого изменения гипотез)
+ *   'decision' Decision               — решение Decider
+ */
+'use strict';
+
+function create() {
+  var handlers = {};
+  return {
+    on: function (name, fn) {
+      (handlers[name] = handlers[name] || []).push(fn);
+    },
+    off: function (name, fn) {
+      var list = handlers[name] || [];
+      for (var i = list.length - 1; i >= 0; i--) if (list[i] === fn) list.splice(i, 1);
+    },
+    emit: function (name, payload) {
+      var list = (handlers[name] || []).slice();
+      for (var i = 0; i < list.length; i++) {
+        try { list[i](payload); } catch (e) {}
+      }
+    }
+  };
+}
+
+module.exports = { create: create };
+  },
+
+  "engine/solver": function (module, exports, require) {
+/*
+ * Solver — сводит гипотезы оценщиков в одну модель «эталон → видео» (SyncModel) со статусом (ADR 2, 3, 7).
+ * Оценщики не объединяются: каждый присылает свои гипотезы, решение принимает только Solver + Decider.
+ *
+ * solve(hypotheses, { release }) → SyncModel
+ *
+ * Правила:
+ *   1. Точки с местом (fromMs: ручные контрольные точки и проверки звуком) — «якоря». Два и больше якоря
+ *      на расстоянии ≥ 5 минут дают наклон (дрейф) методом наименьших квадратов (0.9…1.1).
+ *      Одиночный выброс (> 3σ от прямой по остальным) уходит в rejected; два и больше подряд с одним
+ *      скачком — локальный скачок: модель из двух кусков (класс local).
+ *   2. Ручная точка главнее всего: при ней остальные гипотезы, расходящиеся больше чем на 1.5 с, отброшены.
+ *   3. Без якорей — кластер вокруг самой уверенной гипотезы: совместимы те, кто отличается не больше чем
+ *      на 3·√(σ₁² + σ₂²). Сдвиг — среднее с весами 1/σ². Несовместимые — в rejected.
+ *   4. Статус: verified — ручная точка или суммарная уверенность независимых семейств ≥ 0.8;
+ *      кандидат вставки учитывается, только если его подтвердили звук или точка (ADR 3);
+ *      estimated — суммарная уверенность ≥ 0.3; uncertain — гипотезы есть, но слабые или релиз
+ *      структурно отличается (вырезано, другая версия) без якорей; failed — гипотез нет.
+ *   Время просмотра статус не повышает.
+ */
+'use strict';
+
+var types = require('./types');
+var insertion = require('../estimators/opening-insertion');
+
+var VERIFIED = 0.8;
+var ESTIMATED = 0.3;
+var CONFLICT_MS = 1500;
+var SPAN_MS = 300000;
+var MIN_SIGMA = 300;
+
+// Семейства независимых доказательств: длительность и кандидат вставки — одно семейство.
+var FAMILY = { duration: 'duration', openingInsertion: 'duration', fps: 'fps', crossSubs: 'crossSubs', audio: 'audio', checkpoint: 'checkpoint', profile: 'profile' };
+
+function sigma(h) {
+  return Math.max(MIN_SIGMA, h.sigmaMs);
+}
+
+function located(h) {
+  return h.fromMs !== null && (h.estimator === 'checkpoint' || h.estimator === 'audio');
+}
+
+// Взвешенная прямая через якоря: refMs = fromMs − offsetMs; playerMs = fromMs.
+// Якорь говорит: «в момент плеера fromMs нужен сдвиг offsetMs». Модель: player = ref·a + b.
+function fitLine(anchors) {
+  var sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (var i = 0; i < anchors.length; i++) {
+    var h = anchors[i];
+    var w = (h.estimator === 'checkpoint' ? 4 : 1) * h.confidence / Math.pow(sigma(h) / 1000, 2);
+    var x = h.fromMs - h.offsetMs;
+    var y = h.fromMs;
+    sw += w; sx += w * x; sy += w * y; sxx += w * x * x; sxy += w * x * y;
+  }
+  var den = sw * sxx - sx * sx;
+  var a = den ? (sw * sxy - sx * sy) / den : 1;
+  if (!(a > 0.9 && a < 1.1)) a = 1;
+  var b = (sy - a * sx) / sw;
+  return { scale: a, offsetMs: b };
+}
+
+function spanMs(anchors) {
+  var lo = Infinity, hi = -Infinity;
+  for (var i = 0; i < anchors.length; i++) {
+    lo = Math.min(lo, anchors[i].fromMs);
+    hi = Math.max(hi, anchors[i].fromMs);
+  }
+  return hi - lo;
+}
+
+function constFit(anchors) {
+  // сдвиг по якорям без наклона: последняя ручная точка главнее, иначе взвешенное среднее
+  var manual = anchors.filter(function (h) { return h.estimator === 'checkpoint'; });
+  if (manual.length) return { scale: 1, offsetMs: manual[manual.length - 1].offsetMs };
+  var sw = 0, s = 0;
+  for (var i = 0; i < anchors.length; i++) {
+    var w = anchors[i].confidence / Math.pow(sigma(anchors[i]) / 1000, 2);
+    sw += w;
+    s += w * anchors[i].offsetMs;
+  }
+  return { scale: 1, offsetMs: s / sw };
+}
+
+function predict(line, h) {
+  // сдвиг, который даёт прямая в момент h.fromMs
+  var ref = (h.fromMs - line.offsetMs) / line.scale;
+  return h.fromMs - ref;
+}
+
+function spread(list) {
+  var lo = Infinity, hi = -Infinity;
+  for (var i = 0; i < list.length; i++) {
+    lo = Math.min(lo, list[i].offsetMs);
+    hi = Math.max(hi, list[i].offsetMs);
+  }
+  return hi - lo;
+}
+
+function fitAny(list) {
+  return list.length >= 2 && spanMs(list) >= SPAN_MS ? fitLine(list) : constFit(list);
+}
+
+function single(fit) {
+  return [{ fromMs: null, toMs: null, scale: fit.scale, offsetMs: fit.offsetMs }];
+}
+
+function fitAnchors(anchors) {
+  var sorted = anchors.slice().sort(function (a, b) { return a.fromMs - b.fromMs; });
+
+  // локальный скачок: две группы по времени, в каждой ≥ 2 согласных точек, между группами скачок > 1.5 с
+  if (sorted.length >= 4) {
+    for (var k = 2; k <= sorted.length - 2; k++) {
+      var left = sorted.slice(0, k), right = sorted.slice(k);
+      if (spread(left) > CONFLICT_MS || spread(right) > CONFLICT_MS) continue;
+      var lf = constFit(left), rf = constFit(right);
+      if (Math.abs(lf.offsetMs - rf.offsetMs) <= CONFLICT_MS) continue;
+      var cut = Math.round((left[left.length - 1].fromMs + right[0].fromMs) / 2);
+      var cutRef = cut - lf.offsetMs; // граница куска — во входной шкале (эталон)
+      return {
+        pieces: [
+          { fromMs: null, toMs: cutRef, scale: 1, offsetMs: lf.offsetMs },
+          { fromMs: cutRef, toMs: null, scale: 1, offsetMs: rf.offsetMs }
+        ],
+        rejected: [], cls: 'local', used: sorted
+      };
+    }
+  }
+
+  // выбросы: по одному убираем точку, сильнее всех расходящуюся с прямой по остальным
+  var list = sorted.slice();
+  var rejected = [];
+  while (list.length >= 3) {
+    var worst = -1, worstErr = 0;
+    for (var i = 0; i < list.length; i++) {
+      var rest = list.filter(function (x, j) { return j !== i; });
+      var err = Math.abs(predict(fitAny(rest), list[i]) - list[i].offsetMs);
+      if (err > 3 * sigma(list[i]) && err > CONFLICT_MS && err > worstErr) {
+        worst = i;
+        worstErr = err;
+      }
+    }
+    if (worst < 0) break;
+    rejected.push(list[worst]);
+    list.splice(worst, 1);
+  }
+  // ручная точка не бывает выбросом относительно автоматических: при споре верим ей
+  var manual = list.filter(function (h) { return h.estimator === 'checkpoint'; });
+  if (manual.length) {
+    var mfit = fitAny(manual);
+    list = list.filter(function (h) {
+      if (h.estimator === 'checkpoint') return true;
+      if (Math.abs(predict(mfit, h) - h.offsetMs) > CONFLICT_MS) {
+        rejected.push(h);
+        return false;
+      }
+      return true;
+    });
+  }
+  return { pieces: single(fitAny(list)), rejected: rejected, cls: null, used: list };
+}
+
+function compatible(a, b) {
+  return Math.abs(a.offsetMs - b.offsetMs) <= 3 * Math.sqrt(sigma(a) * sigma(a) + sigma(b) * sigma(b));
+}
+
+// Суммарная уверенность независимых семейств. confirmedOnly: кандидат вставки — только подтверждённый (ADR 3).
+function combined(used, confirmedOnly) {
+  var fam = {};
+  var cand = null;
+  var i;
+  for (i = 0; i < used.length; i++) if (used[i].kind === 'opening_insertion_candidate') cand = used[i];
+  for (i = 0; i < used.length; i++) {
+    var h = used[i];
+    var c = h.confidence;
+    if (h.kind === 'opening_insertion_candidate' && confirmedOnly) {
+      var conf = null;
+      for (var j = 0; j < used.length && !conf; j++) conf = insertion.confirm(cand, used[j]);
+      if (!conf) continue;
+      c = conf.confidence;
+    }
+    var f = FAMILY[h.estimator] || h.estimator;
+    fam[f] = Math.max(fam[f] || 0, c);
+  }
+  var miss = 1;
+  for (var k in fam) miss *= 1 - fam[k];
+  return 1 - miss;
+}
+
+function solve(hyps, opts) {
+  opts = opts || {};
+  hyps = (hyps || []).map(types.hypothesis);
+  // crossSubs и fps для субтитров описывают файл субтитров, а не видео — в модель видео не входят,
+  // кроме fps-дрейфа видео относительно оригинала (estimator 'duration', kind 'drift').
+  hyps = hyps.filter(function (h) { return h.estimator !== 'crossSubs'; });
+  if (!hyps.length) return types.syncModel({ status: 'failed', confidence: 0 });
+
+  var structural = opts.release && opts.release.modelClass === 'structural';
+  var anchors = hyps.filter(located);
+  var rest = hyps.filter(function (h) { return !located(h); });
+  var used = [];
+  var rejected = [];
+  var pieces;
+  var cls = null;
+
+  if (anchors.length) {
+    var r = fitAnchors(anchors);
+    pieces = r.pieces;
+    cls = r.cls;
+    used = r.used;
+    rejected = r.rejected;
+    var manual = anchors.some(function (h) { return h.estimator === 'checkpoint'; });
+    // якоря не дают наклона (мало или близко), а пересчёт кадров известен — берём его наклон,
+    // сдвиг подбираем так, чтобы якоря выполнялись
+    var driftH = rest.filter(function (h) { return Math.abs(h.scale - 1) > 0.0005 && h.confidence >= 0.5; })
+      .sort(function (a, b) { return b.confidence - a.confidence; })[0];
+    if (driftH && pieces.length === 1 && Math.abs(pieces[0].scale - 1) <= 0.0005) {
+      var sb = 0;
+      used.forEach(function (h) { sb += h.fromMs - driftH.scale * (h.fromMs - h.offsetMs); });
+      pieces = [{ fromMs: null, toMs: null, scale: driftH.scale, offsetMs: sb / used.length }];
+    }
+    // остальные гипотезы: совместимые с моделью якорей — в used, далёкие — в rejected
+    rest.forEach(function (h) {
+      var off = pieces[0].offsetMs;
+      var tooFar = Math.abs(h.offsetMs - off) > (manual ? CONFLICT_MS : 3 * Math.sqrt(sigma(h) * sigma(h) + MIN_SIGMA * MIN_SIGMA));
+      if (tooFar || (Math.abs(h.scale - 1) > 0.0005 && Math.abs(h.scale - pieces[0].scale) > 0.0005)) rejected.push(h);
+      else used.push(h);
+    });
+  } else {
+    var drift = rest.filter(function (h) { return Math.abs(h.scale - 1) > 0.0005; })
+      .sort(function (a, b) { return b.confidence - a.confidence; })[0];
+    var flat = rest.filter(function (h) { return Math.abs(h.scale - 1) <= 0.0005; });
+    var anchor = flat.slice().sort(function (a, b) { return b.confidence / sigma(b) - a.confidence / sigma(a); })[0];
+    var sw = 0, so = 0;
+    flat.forEach(function (h) {
+      if (anchor && compatible(anchor, h)) {
+        used.push(h);
+        var w = h.confidence / Math.pow(sigma(h) / 1000, 2);
+        sw += w;
+        so += w * h.offsetMs;
+      } else rejected.push(h);
+    });
+    if (drift) used.push(drift);
+    rest.filter(function (h) { return Math.abs(h.scale - 1) > 0.0005 && h !== drift; }).forEach(function (h) { rejected.push(h); });
+    pieces = [{ fromMs: null, toMs: null, scale: drift ? drift.scale : 1, offsetMs: sw ? so / sw : drift ? drift.offsetMs : 0 }];
+  }
+
+  var conf = combined(used, true);
+  var loose = combined(used, false);
+  var hasManual = used.some(function (h) { return h.estimator === 'checkpoint'; });
+  var status;
+  if (hasManual) status = 'verified';
+  else if (structural && !anchors.length) status = 'uncertain';
+  else if (conf >= VERIFIED) status = 'verified';
+  else if (loose >= ESTIMATED) status = 'estimated';
+  else status = used.length ? 'uncertain' : 'failed';
+
+  if (!cls) cls = structural ? 'structural' : Math.abs(pieces[0].scale - 1) > 0.0005 ? 'drift' : 'constant';
+  return types.syncModel({
+    pieces: pieces,
+    'class': cls,
+    status: status,
+    confidence: Math.round((status === 'verified' ? conf : loose) * 1000) / 1000,
+    used: used,
+    rejected: rejected
+  });
+}
+
+module.exports = { solve: solve, VERIFIED: VERIFIED, ESTIMATED: ESTIMATED, CONFLICT_MS: CONFLICT_MS };
   },
 
   "engine/time": function (module, exports, require) {
@@ -1068,6 +1430,9 @@ require('./legacy/plugin');
   var subtitle = require('../analyzers/subtitle');
   var crossSubs = require('../estimators/cross-subs');
   var fpsEstimator = require('../estimators/fps');
+  var solver = require('../engine/solver');
+  var decider = require('../engine/decider');
+  var engineEvents = require('../engine/events').create();
 
   function log() {
     try {
@@ -1464,7 +1829,7 @@ require('./legacy/plugin');
 
     download(fid, function (text, link) {
       if (text) texts[fid] = text;
-      var url = text ? textUrl(applySync(text, composed(fid))) : link;
+      var url = text ? buildTrack(fid) : link;
       var state = videoSubs();
       if (!url || !state) return fail();
       var list = copySubs(state.subs);
@@ -1562,9 +1927,13 @@ require('./legacy/plugin');
     s.waiting = 0;
     var t = s.bg && findTrack(s.bg);
     log('фон завершён:', why);
-    if (t && ccWanted()) {
+    var d = engineDecide();
+    if (t && ccWanted() && (why === 'ok' || d.action === 'show')) {
       showTrack(t);
       if (why === 'ok') notify('Субтитры синхронизированы по звуку и включены');
+    } else if (t && ccWanted()) {
+      s.calibrate = true;
+      notify('Звук не подтвердил синхронизацию (' + why + '). Нажмите CC, чтобы включить субтитры, или выберите фразу в меню');
     }
     updateButtons();
   }
@@ -1589,25 +1958,27 @@ require('./legacy/plugin');
               maybeAutoSync(t);
             } else {
               // автовключение: файл выравнивается по английским, видео — по длительности оригинала и кадрам.
-              // Фильмы и серии с известной длительностью оригинала показываем сразу; остальные — после проверки по звуку.
+              // Что делать дальше, решает Decider: verified/estimated — показать (estimated — с меткой на CC),
+              // uncertain/failed — ждать звук или предложить калибровку.
               maybeAutoSync(t);
               s.pending = true;
               updateButtons();
-              durationSync(function (ok) {
+              durationSync(function () {
                 s.pending = false;
                 if (session !== s || !ccWanted()) return updateButtons();
-                if (ok || isMovie(s) || videoSync().manual || !canListen()) {
+                var d = engineDecide();
+                log('решение:', d.action, 'правило', d.rule, d.reason);
+                if (d.action === 'show') {
                   showTrack(t);
                   return updateButtons();
                 }
-                // оригинала у источника нет: сверяем таймлайн субтитров с длительностью видео
-                timelineOk(t, function (good, why) {
-                  if (session !== s || !ccWanted()) return updateButtons();
-                  s.timeline = why;
-                  if (good) showTrack(t);
-                  else startBackground(s, t);
-                  updateButtons();
-                });
+                if (d.action === 'wait') {
+                  startBackground(s, t);
+                  return updateButtons();
+                }
+                s.calibrate = true;
+                notify('Субтитры готовы, но синхронизацию не подтвердить. Нажмите CC, чтобы включить, или выберите фразу в меню субтитров');
+                updateButtons();
               });
               return;
             }
@@ -1639,9 +2010,11 @@ require('./legacy/plugin');
     updateButtons();
     if (track && track.os_id) {
       var s1 = session;
-      // звук — только для сериалов, где не получилось по длительности оригинала (у фильмов не нужен)
-      durationSync(function (ok) {
-        if (s1 && session === s1 && !ok && !isMovie(s1)) {
+      // звук уточняет неподтверждённую модель (у фильмов не нужен) — решает Decider
+      durationSync(function () {
+        if (!s1 || session !== s1) return;
+        var d = engineDecide();
+        if (d.listen) {
           s1.useAudio = true;
           audioStart();
         }
@@ -1791,7 +2164,7 @@ require('./legacy/plugin');
       var k = videoKeys(s);
       var c = store('opensubs_vsync3')[k.exact];
       // догадки «как у прошлой серии / как у студии» убраны: заставки у одной студии в разных сериалах разные
-      s.vsync = c ? { scale: c.scale, offset: c.offset, anchors: c.anchors || [], manual: !!c.manual, src: c.src }
+      s.vsync = c ? { scale: c.scale, offset: c.offset, pieces: c.pieces || null, anchors: c.anchors || [], manual: !!c.manual, src: c.src }
         : { scale: 1, offset: 0, anchors: [] };
     }
     return s.vsync;
@@ -1806,7 +2179,7 @@ require('./legacy/plugin');
     if (v.scale === 1 && !v.offset && !v.anchors.length && !v.src) delete all[k.exact];
     else {
       var dd = s.durDiff === null || typeof s.durDiff === 'undefined' ? undefined : round3(s.durDiff);
-      all[k.exact] = { scale: v.scale, offset: round3(v.offset), anchors: v.anchors.slice(-8), manual: !!v.manual, src: v.src, dd: dd, t: Date.now() };
+      all[k.exact] = { scale: v.scale, offset: round3(v.offset), pieces: v.pieces || undefined, anchors: v.anchors.slice(-8), manual: !!v.manual, src: v.src, dd: dd, t: Date.now() };
     }
     storeSave('opensubs_vsync3', all, 500);
     try { localStorage.removeItem('opensubs_vprior'); localStorage.removeItem('opensubs_vsync'); } catch (e) {} // старые догадки
@@ -1819,10 +2192,6 @@ require('./legacy/plugin');
   }
 
   // Разбор и пересчёт таймингов — analyzers/subtitle.js (мс); здесь — переходники на секунды прототипа.
-  function applySync(text, sync) {
-    return subtitle.retime(text, time.linear(sync.scale, sync.offset * 1000));
-  }
-
   function fmtTime(t) {
     return time.formatClock(t * 1000);
   }
@@ -1832,8 +2201,41 @@ require('./legacy/plugin');
     return subtitle.parse(text).map(function (c) { return { start: c.startMs / 1000, end: c.endMs / 1000, text: c.text }; });
   }
 
+  // Время реплики файла → время плеера: файл → эталон (fileSync), эталон → видео (videoSync, возможно по кускам).
+  function cueFn(fid) {
+    var f = fileSync(fid);
+    var v = videoSync();
+    var subsP = time.linear(f.scale, f.offset * 1000);
+    var vidP = v.pieces && v.pieces.length > 1 ? v.pieces : time.linear(v.scale, v.offset * 1000);
+    return function (ms) { return time.cueToPlayer(subsP, vidP, ms); };
+  }
+
+  var applied = {}; // file_id → [{ start, end }] в секундах плеера, как сейчас показывает плеер
+
+  // Файл для плеера. hold: { at, prev } — плавная коррекция: реплики, которые при новой модели
+  // всплыли бы посреди показа или повторились бы, в этом файле пропускаются (вернутся при перемотке).
+  function buildTrack(fid, hold) {
+    var fn = cueFn(fid);
+    var cues = subtitle.parse(texts[fid]);
+    var out = [];
+    var now = [];
+    for (var i = 0; i < cues.length; i++) {
+      var a = fn(cues[i].startMs), b = fn(cues[i].endMs);
+      now.push({ start: a / 1000, end: b / 1000 });
+      if (hold && hold.prev && hold.prev[i]) {
+        var at = hold.at * 1000, p = hold.prev[i];
+        var popsUp = a < at && b > at && !(p.start * 1000 <= at && p.end * 1000 > at);
+        var repeats = p.end * 1000 <= at && a >= at;
+        if (popsUp || repeats) continue;
+      }
+      out.push({ startMs: a, endMs: b, text: cues[i].text, raw: cues[i].raw });
+    }
+    applied[fid] = now;
+    return textUrl(subtitle.build(out));
+  }
+
   // пересобрать файлы всех дорожек OpenSubtitles с текущими поправками, выбранную оставить включённой
-  function resyncAll() {
+  function resyncNow(hold) {
     var state = videoSubs();
     if (!state) return;
     var on = isShowing();
@@ -1843,7 +2245,7 @@ require('./legacy/plugin');
     for (var j = 0; j < list.length; j++) {
       var fid = list[j].os_id;
       if (!fid || !texts[fid]) continue;
-      var url = textUrl(applySync(texts[fid], composed(fid)));
+      var url = buildTrack(fid, hold && fid === hold.fid ? hold : null);
       if (url) {
         list[j].url = url;
         changed = true;
@@ -1861,49 +2263,122 @@ require('./legacy/plugin');
     }
   }
 
+  // Плавная коррекция (документ, «После показа»): новая модель применяется в паузе между репликами
+  // не короче 1 с; реплика на экране досиживает со старыми таймингами; при перемотке — сразу.
+  var resyncTimer = null;
+  function resyncAll() {
+    clearInterval(resyncTimer);
+    var on = isShowing();
+    var v = null;
+    try { v = Lampa.PlayerVideo.video(); } catch (e) {}
+    var fid = on && on.os_id;
+    if (!fid || !applied[fid] || !v || v.paused || v.seeking) return resyncNow();
+    var prev = applied[fid];
+    var started = Date.now();
+    var onSeek = function () { stop(); resyncNow(); };
+    var stop = function () {
+      clearInterval(resyncTimer);
+      resyncTimer = null;
+      try { v.removeEventListener('seeking', onSeek); } catch (e) {}
+    };
+    try { v.addEventListener('seeking', onSeek); } catch (e) {}
+    var tick = function () {
+      var t = v.currentTime;
+      if (Date.now() - started < 20000) { // не дольше 20 с ждём паузу
+        // реплика на экране или начнётся меньше чем через секунду — ждём
+        for (var i = 0; i < prev.length; i++) if (prev[i].start <= t + 1 && prev[i].end >= t) return;
+      }
+      stop();
+      resyncNow({ fid: fid, at: t, prev: prev });
+    };
+    resyncTimer = setInterval(tick, 200);
+    tick();
+  }
+
   function videoTime() {
     try { return Lampa.PlayerVideo.video().currentTime || 0; } catch (e) { return 0; }
   }
 
-  // Якорь: «момент o (в координатах выровненного файла) должен показываться в t». Одна точка — сдвиг,
-  // точки дальше 5 минут друг от друга — сдвиг и скорость (наклон прямой по методу наименьших квадратов).
+  // ---------- движок: гипотезы → модель → решение (engine/solver.js, engine/decider.js) ----------
+  // Якорь: «момент o (в координатах эталона) должен показываться в t» — ручная фраза (checkpoint)
+  // или проверка звуком (audio). Модель считает Solver вместе с гипотезами длительности и кадров.
+
+  function anchorHyps(v) {
+    var out = [];
+    var manualPoint = false;
+    for (var i = 0; i < (v.anchors || []).length; i++) {
+      var a = v.anchors[i];
+      var phrase = a.k === 'phrase';
+      if (phrase) manualPoint = true;
+      out.push({ estimator: phrase ? 'checkpoint' : 'audio', kind: 'offset', offsetMs: Math.round((a.t - a.o) * 1000),
+        fromMs: Math.round(a.t * 1000), toMs: Math.round(a.t * 1000) + 1, sigmaMs: 300, confidence: phrase ? 1 : (a.c || 0.85),
+        evidence: [{ what: phrase ? 'фраза' : 'звук', value: round3(a.t - a.o), source: phrase ? 'пользователь' : 'audio' }] });
+    }
+    // ручной сдвиг из меню — тоже решение пользователя
+    if (v.manual && !manualPoint) {
+      var at = Math.max(1000, Math.round(videoTime() * 1000));
+      out.push({ estimator: 'checkpoint', kind: 'offset', offsetMs: Math.round(v.offset * 1000), fromMs: at, toMs: at + 1, sigmaMs: 300, confidence: 1,
+        evidence: [{ what: 'сдвиг вручную', value: v.offset, source: 'пользователь' }] });
+    }
+    return out;
+  }
+
+  function engineHyps(s, v) {
+    var hs = [];
+    if (s.release) hs = hs.concat(s.release.hypotheses);
+    if (s.fpsHyp) hs.push(s.fpsHyp);
+    if (s.profileHyp) hs.push(s.profileHyp);
+    return hs.concat(anchorHyps(v || videoSync()));
+  }
+
+  function engineModel(v) {
+    var s = session;
+    if (!s) return null;
+    var m = solver.solve(engineHyps(s, v), { release: s.release });
+    s.model = m;
+    engineEvents.emit('model', m);
+    return m;
+  }
+
+  function engineDecide() {
+    var s = session;
+    if (!s) return decider.decide(null, {});
+    var m = s.model || engineModel();
+    var was = s.decision && s.model && s.model.status;
+    var d = decider.decide(m, { movie: isMovie(s), canListen: canListen(), release: s.release });
+    s.decision = d;
+    engineEvents.emit('decision', d);
+    if (was === 'estimated' && m.status === 'verified' && isShowing()) notify('Синхронизация субтитров подтверждена');
+    updateButtons();
+    return d;
+  }
+
   function fitAnchors(v) {
-    var an = v.anchors;
-    if (!an.length) return v;
-    var minO = Infinity, maxO = -Infinity;
-    for (var i = 0; i < an.length; i++) {
-      minO = Math.min(minO, an[i].o);
-      maxO = Math.max(maxO, an[i].o);
+    if (!v.anchors.length) return v;
+    var m = engineModel(v);
+    if (m.status === 'failed') {
+      var last = v.anchors[v.anchors.length - 1];
+      v.offset = last.t - last.o * v.scale;
+      return v;
     }
-    if (an.length >= 2 && maxO - minO >= 300) {
-      var n = an.length, so = 0, st = 0, soo = 0, sot = 0;
-      for (var j = 0; j < n; j++) {
-        so += an[j].o; st += an[j].t; soo += an[j].o * an[j].o; sot += an[j].o * an[j].t;
-      }
-      var den = n * soo - so * so;
-      var sc = den ? (n * sot - so * st) / den : 1;
-      if (sc > 0.9 && sc < 1.1) {
-        v.scale = sc;
-        v.offset = (st - sc * so) / n;
-        return v;
-      }
-    }
-    var last = an[an.length - 1];
-    v.offset = last.t - last.o * v.scale;
+    v.scale = m.pieces[0].scale;
+    v.offset = m.pieces[0].offsetMs / 1000;
+    v.pieces = m.pieces.length > 1 ? m.pieces : null;
     return v;
   }
 
   // добавить якорь (старые рядом с ним заменяются)
-  function addAnchor(o, t, kind) {
+  function addAnchor(o, t, kind, conf) {
     var v = videoSync();
     if (kind === 'phrase') v.manual = true;
     v.anchors = v.anchors.filter(function (x) { return Math.abs(x.o - o) > 90; });
-    v.anchors.push({ o: round3(o), t: round3(t), k: kind });
+    v.anchors.push({ o: round3(o), t: round3(t), k: kind, c: conf || undefined });
     if (v.anchors.length > 8) v.anchors = v.anchors.slice(-8);
     v.prior = false;
     setVideoSync(fitAnchors(v));
     if (kind === 'phrase') learnResidual();
     resyncAll();
+    engineDecide();
     return v;
   }
 
@@ -2041,11 +2516,6 @@ require('./legacy/plugin');
     tick();
   }
 
-  // субтитры (эталон) и видео в разной системе кадров: 25 (PAL) против 23.976/24 → estimators/fps.js
-  function palScale(subFps, vidFps) {
-    return fpsEstimator.estimate({ subsFps: subFps, videoFpsDeclared: vidFps }).scale;
-  }
-
   function isMovie(s) {
     return !episodeInfo(s.data) && !(s.card && (s.card.name || s.card.original_name));
   }
@@ -2093,40 +2563,32 @@ require('./legacy/plugin');
         s.durStatus = rel.text;
         log('длительность: видео', (videoMs / 1000).toFixed(2) + (exact ? '' : ' (video.duration)'), 'оригиналы',
           origs.map(function (o) { return o.source + ' ' + (o.durationMs / 1000).toFixed(2); }).join(', '), '→', rel.cls);
-        var nearOwn = false;
-        for (var oi = 0; oi < origs.length; oi++) if (origs[oi].own && rel.nearest && origs[oi].source === rel.nearest.source) nearOwn = true;
-        var v = { scale: 1, offset: 0, anchors: [], src: 'duration' };
-        var diff = null;
-        if (rel.cls === 'fps') v.scale = rel.ratio;
-        else if (rel.cls === 'same' || rel.cls === 'near') diff = 0;
-        else if (rel.cls === 'insertion' && !(rel.spreadMs > diagnostics.LIMITS.disagreeMs && !nearOwn && rel.agree < 2)) {
-          diff = rel.deltaMs / 1000;
-          v.offset = diff;
-        } else {
-          applyFpsOnly(s.durStatus);
-          return finishD(false);
-        }
-        s.durDiff = diff;
-        // видео и оригинал совпадают по скорости, но эталонные субтитры в другой системе кадров
-        if (v.scale === 1 && s.palScale && s.palScale !== 1) {
-          v.scale = s.palScale;
-          s.durStatus += '; частота кадров субтитров: ×' + s.palScale.toFixed(4);
-        }
-        // заставка площадки (Netflix и т. п.) есть и в оригинале, но не в релизе, под который сделаны субтитры:
-        // её размер узнаём из ручной поправки на любой серии этого сериала у этого источника
+        s.durDiff = rel.cls === 'insertion' ? rel.deltaMs / 1000 : rel.cls === 'same' || rel.cls === 'near' ? 0 : null;
+        // заставка площадки, выученная на другой серии этого сериала, — только гипотеза с низким доверием (ADR 4)
         var res = residual(s);
-        if (res !== null && v.scale === 1) {
-          v.offset += res;
-          s.durStatus += ', заставка площадки ' + (res > 0 ? '+' : '') + res.toFixed(1) + ' с';
-        }
+        s.profileHyp = res !== null && s.durDiff !== null ? { estimator: 'profile', kind: 'offset', offsetMs: Math.round((s.durDiff + res) * 1000),
+          sigmaMs: 3000, confidence: 0.3, evidence: [{ what: 'как в другой серии этого источника', value: res, source: 'profile' }] } : null;
         var old = videoSync();
         if (old.manual) {
           learnResidual(); // ручная поправка этой серии уже есть — узнаём из неё заставку площадки
+          engineModel();
           return finishD(true);
         }
+        var m = engineModel({ anchors: old.anchors || [] });
+        log('модель:', m.status, m['class'], (m.pieces[0].offsetMs / 1000).toFixed(2) + ' с', '×' + m.pieces[0].scale.toFixed(4),
+          'уверенность', m.confidence);
+        if (m.status === 'failed' || m.status === 'uncertain') {
+          applyFpsOnly(s.durStatus);
+          return finishD(false);
+        }
+        var v = { scale: m.pieces[0].scale, offset: m.pieces[0].offsetMs / 1000, pieces: m.pieces.length > 1 ? m.pieces : null,
+          anchors: old.anchors || [], src: 'duration' };
+        if (s.palScale && s.palScale !== 1) s.durStatus += '; частота кадров субтитров: ×' + s.palScale.toFixed(4);
         setVideoSync(v);
         resyncAll();
-        if (Math.abs(v.offset - (old.offset || 0)) >= 0.5 || v.scale !== (old.scale || 1)) notify('Субтитры подстроены под озвучку: ' + s.durStatus);
+        if (Math.abs(v.offset - (old.offset || 0)) >= 0.5 || v.scale !== (old.scale || 1)) {
+          notify((m.status === 'verified' ? 'Субтитры подстроены под озвучку: ' : 'Субтитры подстроены предварительно: ') + s.durStatus);
+        }
         finishD(true);
       };
       if (s.probe && s.probe.durationMs && s.probe.exact) return withVideo(s.probe.durationMs, true);
@@ -2154,7 +2616,9 @@ require('./legacy/plugin');
       // эталон — английские; если их нет — сам файл показываемых субтитров
       var bgT = s.bg && findTrack(s.bg);
       var refFps = (ref && parseFloat(ref.fps)) || (bgT && bgT.os_fps) || 0;
-      s.palScale = palScale(refFps, vf);
+      var fe = fpsEstimator.estimate({ subsFps: refFps, videoFpsDeclared: vf });
+      s.palScale = fe.scale;
+      s.fpsHyp = fe.hypothesis;
       if (s.palScale !== 1) log('кадры: субтитры', refFps, 'видео', vf, '→ ×' + s.palScale.toFixed(4));
       runDuration();
     });
@@ -2365,10 +2829,10 @@ require('./legacy/plugin');
     }
     a.status = 'последняя проверка: ' + (shift > 0 ? '+' : '') + shift.toFixed(1) + ' с (уверенность ' + z1.toFixed(1) + ')';
 
-    if (Math.abs(shift) < 0.25) return finishBackground('ok');
     var center = (tStart + tEnd) / 2;
     var o = (center - vs.offset) / vs.scale;
-    addAnchor(o, center + shift, 'audio');
+    // z ≥ 4.5 сам по себе подтверждает (правило 7); слабее — только вместе с кандидатом вставки (ADR 3)
+    addAnchor(o, center + shift, 'audio', z1 >= 4.5 && !agree ? 0.85 : agree && z1 >= 4.5 ? 0.9 : 0.6);
     finishBackground('ok');
     if (!a.told && Math.abs(shift) >= 1) {
       a.told = true;
@@ -2589,6 +3053,7 @@ require('./legacy/plugin');
       '<g class="ops-cc-off" clip-path="url(#ops-cc-rest-' + n + ')"><rect x="1.25" y="3.75" width="18.5" height="13.5" rx="3.2" stroke="currentColor" stroke-width="2.5"/>' +
       '<path d="' + CC_PATH + '" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/></g>' +
       '<g class="ops-cc-on" clip-path="url(#ops-cc-clip-' + n + ')"><rect x="0" y="2.5" width="21" height="16" rx="4.4" fill="currentColor" mask="url(#ops-cc-mask-' + n + ')"/></g>' +
+      '<circle class="ops-cc-dot" cx="18.6" cy="4" r="3.1" fill="#f5b400" stroke="rgba(0,0,0,.55)" stroke-width="1.2"/>' +
       '</svg>';
   }
 
@@ -2642,6 +3107,9 @@ require('./legacy/plugin');
     var sel = '.player-video__subtitles';
     var rules = [
       'body.ops-has-btn .player-panel__subs{display:none !important}',
+      // метка «синхронизация не подтверждена» (статус estimated, ADR 3)
+      '.ops-btn .ops-cc-dot{display:none}',
+      '.ops-btn.ops-on.ops-unconfirmed .ops-cc-dot{display:inline}',
 
       'body.ops-shadow-none ' + sel + '{text-shadow:none !important}',
       'body.ops-shadow-none ' + sel + ' .player-video__subtitles-text{background:none !important}',
@@ -2819,12 +3287,15 @@ require('./legacy/plugin');
     var on = !!isShowing();
     var waiting = !!(session && session.waiting);
     var pending = !!(session && (session.pending || waiting || (session.searching && ccWanted())));
+    var shown = isShowing();
+    var unconfirmed = !!(shown && shown.os_id && session && session.decision && session.decision.marker === 'unconfirmed' && !videoSync().manual);
     var btns = document.querySelectorAll('.ops-btn');
     for (var i = 0; i < btns.length; i++) {
       btns[i].classList.toggle('ops-on', on);
       btns[i].classList.toggle('ops-pending', pending && !on);
+      btns[i].classList.toggle('ops-unconfirmed', unconfirmed);
       var tip = btns[i].querySelector('.tooltip');
-      if (tip) tip.textContent = on ? 'Выключить субтитры' : waiting ? 'Сверяю субтитры со звуком: ' + Math.round(audioProgress() * 100) + '% — нажмите, чтобы включить сразу' : pending ? 'Готовлю субтитры…' : 'Включить субтитры';
+      if (tip) tip.textContent = on ? (unconfirmed ? 'Выключить субтитры (синхронизация не подтверждена)' : 'Выключить субтитры') : waiting ? 'Сверяю субтитры со звуком: ' + Math.round(audioProgress() * 100) + '% — нажмите, чтобы включить сразу' : pending ? 'Готовлю субтитры…' : 'Включить субтитры';
     }
     if (on) setCcFill(1, false);
     else if (waiting && audio && audio.samples.length) setCcFill(audioProgress(), false); // известный прогресс
