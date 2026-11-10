@@ -1,6 +1,360 @@
 /*
  * OpenSubs — субтитры OpenSubtitles во встроенном плеере Lampa.
  * Самостоятельный клиентский плагин: сервер Lampac не нужен и не затрагивается.
+ *
+ * Файл собран build.js из mods-src/OpenSubs/src — правьте исходники, не этот файл.
+ */
+(function () {
+  var defs = {
+  "engine/time": function (module, exports, require) {
+/*
+ * Единая шкала времени движка (ADR 6).
+ *
+ * Внутри движка все времена — целые миллисекунды шкалы воспроизведения плеера.
+ * Другие шкалы переводятся только функциями этого модуля:
+ *   - субтитры:  время реплики в файле субтитров (cueMs);
+ *   - эталон:    время эталонного релиза, к которому приведены субтитры (refMs);
+ *   - плеер:     currentTime видео * 1000 (playerMs);
+ *   - потоки:    PTS потока = playerMs + stream.startMs (известно только из FFProbe).
+ *
+ * Модель — список кусков { fromMs, toMs, scale, offsetMs }: out = in * scale + offsetMs.
+ * fromMs/toMs задаются во входной шкале куска; null — без границы.
+ * Это ES5: файл попадает в бандл для старых ТВ-браузеров.
+ */
+'use strict';
+
+// Кадровые частоты. «23.976» на самом деле 24000/1001.
+var FPS = {
+  FILM: 24000 / 1001,
+  CINEMA: 24,
+  PAL: 25,
+  NTSC: 30000 / 1001
+};
+
+function toMs(sec) {
+  return Math.round(sec * 1000);
+}
+
+function toSec(ms) {
+  return ms / 1000;
+}
+
+// '01:02:03.456', '02:03,456', '02:03.4' → мс; иначе NaN.
+function parseClock(str) {
+  var m = /^\s*(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,](\d{1,3}))?\s*$/.exec(String(str));
+  if (!m) return NaN;
+  var frac = m[4] ? Number((m[4] + '00').slice(0, 3)) : 0;
+  return ((Number(m[1] || 0) * 60 + Number(m[2])) * 60 + Number(m[3])) * 1000 + frac;
+}
+
+function pad(n, w) {
+  var s = String(n);
+  while (s.length < w) s = '0' + s;
+  return s;
+}
+
+// мс → 'HH:MM:SS.mmm' (формат WebVTT). Отрицательное время обрезается до нуля.
+function formatClock(ms) {
+  ms = Math.max(0, Math.round(ms));
+  var h = Math.floor(ms / 3600000);
+  var m = Math.floor(ms / 60000) % 60;
+  var s = Math.floor(ms / 1000) % 60;
+  return pad(h, 2) + ':' + pad(m, 2) + ':' + pad(s, 2) + '.' + pad(ms % 1000, 3);
+}
+
+// Отношение частот для пересчёта таймингов: субтитры под fromFps → видео с toFps.
+// Пример: субтитры под 25 к/с на видео 23.976 → scale = 25 / 23.976 ≈ 1.0427.
+function fpsRatio(fromFps, toFps) {
+  return fromFps / toFps;
+}
+
+function identity() {
+  return [{ fromMs: null, toMs: null, scale: 1, offsetMs: 0 }];
+}
+
+function constant(offsetMs) {
+  return [{ fromMs: null, toMs: null, scale: 1, offsetMs: Math.round(offsetMs) }];
+}
+
+function linear(scale, offsetMs) {
+  return [{ fromMs: null, toMs: null, scale: scale, offsetMs: Math.round(offsetMs) }];
+}
+
+function covers(piece, ms) {
+  return (piece.fromMs === null || piece.fromMs === undefined || ms >= piece.fromMs) &&
+    (piece.toMs === null || piece.toMs === undefined || ms < piece.toMs);
+}
+
+// Кусок для времени ms; вне всех кусков — ближайший по границе.
+function pieceFor(pieces, ms) {
+  var best = null;
+  var bestDist = Infinity;
+  for (var i = 0; i < pieces.length; i++) {
+    var p = pieces[i];
+    if (covers(p, ms)) return p;
+    var d = p.fromMs !== null && p.fromMs !== undefined && ms < p.fromMs ? p.fromMs - ms :
+      p.toMs !== null && p.toMs !== undefined && ms >= p.toMs ? ms - p.toMs : Infinity;
+    if (d < bestDist) {
+      bestDist = d;
+      best = p;
+    }
+  }
+  return best;
+}
+
+function apply(pieces, ms) {
+  if (!pieces || !pieces.length) return Math.round(ms);
+  var p = pieceFor(pieces, ms);
+  return Math.round(ms * p.scale + p.offsetMs);
+}
+
+// Субтитры → эталон → плеер. subs и video — списки кусков.
+function cueToPlayer(subs, video, cueMs) {
+  return apply(video, apply(subs, cueMs));
+}
+
+// Перевод времени плеера во время потока (ADR 6: только явно).
+function playerToStream(playerMs, stream) {
+  return playerMs + (stream && stream.startMs ? stream.startMs : 0);
+}
+
+function streamToPlayer(streamMs, stream) {
+  return streamMs - (stream && stream.startMs ? stream.startMs : 0);
+}
+
+module.exports = {
+  FPS: FPS,
+  toMs: toMs,
+  toSec: toSec,
+  parseClock: parseClock,
+  formatClock: formatClock,
+  fpsRatio: fpsRatio,
+  identity: identity,
+  constant: constant,
+  linear: linear,
+  pieceFor: pieceFor,
+  apply: apply,
+  cueToPlayer: cueToPlayer,
+  playerToStream: playerToStream,
+  streamToPlayer: streamToPlayer
+};
+  },
+
+  "engine/types": function (module, exports, require) {
+/*
+ * Типы обмена между модулями движка: ProbeInfo, Hypothesis, SyncModel, SubsProfile, VideoProfile.
+ * Фабрики нормализуют поля и бросают TypeError на неверных данных, чтобы ошибка оценщика
+ * не дошла до плеера. Все времена — целые мс шкалы плеера (ADR 6), см. engine/time.js.
+ */
+'use strict';
+
+var ESTIMATORS = ['duration', 'openingInsertion', 'fps', 'crossSubs', 'audio', 'checkpoint', 'profile'];
+
+var KINDS = [
+  'duration_delta',
+  'opening_insertion_candidate',
+  'opening_insertion_confirmed',
+  'offset',
+  'drift',
+  'piece'
+];
+
+// ADR 7. Порядок — от сильного к слабому.
+var STATUS = ['verified', 'estimated', 'uncertain', 'failed'];
+
+var CLASSES = ['constant', 'drift', 'local', 'structural'];
+
+var PROBE_SOURCES = ['client', 'ffprobe', 'unknown'];
+
+function oneOf(list, value, field) {
+  for (var i = 0; i < list.length; i++) if (list[i] === value) return value;
+  throw new TypeError(field + ': ' + value + ' не из [' + list.join(', ') + ']');
+}
+
+function num(value, field, def) {
+  if (value === undefined || value === null) {
+    if (def !== undefined) return def;
+    throw new TypeError(field + ': нет значения');
+  }
+  if (typeof value !== 'number' || !isFinite(value)) throw new TypeError(field + ': не число');
+  return value;
+}
+
+function optMs(value, field) {
+  return value === undefined || value === null ? null : Math.round(num(value, field));
+}
+
+function unit(value, field) {
+  var v = num(value, field);
+  if (v < 0 || v > 1) throw new TypeError(field + ': вне 0..1');
+  return v;
+}
+
+function evidenceList(list) {
+  if (!list) return [];
+  if (!(list instanceof Array)) throw new TypeError('evidence: не массив');
+  var out = [];
+  for (var i = 0; i < list.length; i++) {
+    var e = list[i] || {};
+    if (!e.what) throw new TypeError('evidence[' + i + '].what: нет значения');
+    out.push({ what: String(e.what), value: e.value === undefined ? null : e.value, source: e.source ? String(e.source) : null });
+  }
+  return out;
+}
+
+function probeInfo(o) {
+  o = o || {};
+  var fps = o.fps || {};
+  var streams = o.streams || [];
+  var out = {
+    source: oneOf(PROBE_SOURCES, o.source || 'unknown', 'source'),
+    durationMs: optMs(o.durationMs, 'durationMs'),
+    exact: !!o.exact,
+    fps: {
+      declared: fps.declared === undefined || fps.declared === null ? null : num(fps.declared, 'fps.declared'),
+      measured: fps.measured === undefined || fps.measured === null ? null : num(fps.measured, 'fps.measured')
+    },
+    vfr: o.vfr === true || o.vfr === false ? o.vfr : null,
+    streams: []
+  };
+  for (var i = 0; i < streams.length; i++) {
+    var s = streams[i] || {};
+    out.streams.push({
+      kind: oneOf(['video', 'audio'], s.kind, 'streams[' + i + '].kind'),
+      startMs: optMs(s.startMs, 'streams[' + i + '].startMs') || 0,
+      durationMs: optMs(s.durationMs, 'streams[' + i + '].durationMs'),
+      timeBase: s.timeBase ? String(s.timeBase) : null
+    });
+  }
+  return out;
+}
+
+function hypothesis(o) {
+  o = o || {};
+  var h = {
+    estimator: oneOf(ESTIMATORS, o.estimator, 'estimator'),
+    kind: oneOf(KINDS, o.kind, 'kind'),
+    offsetMs: Math.round(num(o.offsetMs, 'offsetMs')),
+    scale: num(o.scale, 'scale', 1),
+    fromMs: optMs(o.fromMs, 'fromMs'),
+    toMs: optMs(o.toMs, 'toMs'),
+    sigmaMs: Math.round(num(o.sigmaMs, 'sigmaMs')),
+    confidence: unit(o.confidence, 'confidence'),
+    evidence: evidenceList(o.evidence)
+  };
+  if (h.scale <= 0) throw new TypeError('scale: должен быть > 0');
+  if (h.sigmaMs < 0) throw new TypeError('sigmaMs: отрицательный');
+  if (h.fromMs !== null && h.toMs !== null && h.fromMs >= h.toMs) throw new TypeError('fromMs >= toMs');
+  return h;
+}
+
+function piece(o) {
+  o = o || {};
+  var p = {
+    fromMs: optMs(o.fromMs, 'fromMs'),
+    toMs: optMs(o.toMs, 'toMs'),
+    scale: num(o.scale, 'scale', 1),
+    offsetMs: Math.round(num(o.offsetMs, 'offsetMs', 0))
+  };
+  if (p.scale <= 0) throw new TypeError('scale: должен быть > 0');
+  return p;
+}
+
+function syncModel(o) {
+  o = o || {};
+  var pieces = o.pieces && o.pieces.length ? o.pieces : [{}];
+  var out = {
+    pieces: [],
+    'class': oneOf(CLASSES, o['class'] || 'constant', 'class'),
+    status: oneOf(STATUS, o.status || 'failed', 'status'),
+    confidence: unit(o.confidence === undefined ? 0 : o.confidence, 'confidence'),
+    used: (o.used || []).map(hypothesis),
+    rejected: (o.rejected || []).map(hypothesis)
+  };
+  for (var i = 0; i < pieces.length; i++) out.pieces.push(piece(pieces[i]));
+  return out;
+}
+
+function subsProfile(o) {
+  o = o || {};
+  if (o.fileId === undefined || o.fileId === null) throw new TypeError('fileId: нет значения');
+  return {
+    fileId: String(o.fileId),
+    refRelease: o.refRelease ? String(o.refRelease) : null,
+    scale: num(o.scale, 'scale', 1),
+    offsetMs: Math.round(num(o.offsetMs, 'offsetMs', 0))
+  };
+}
+
+function videoProfile(o) {
+  o = o || {};
+  var k = o.key || {};
+  if (!k.card) throw new TypeError('key.card: нет значения');
+  var cps = o.checkpoints || [];
+  var out = {
+    key: {
+      card: String(k.card),
+      season: k.season === undefined || k.season === null ? null : Number(k.season),
+      episode: k.episode === undefined || k.episode === null ? null : Number(k.episode),
+      balancer: k.balancer ? String(k.balancer) : null,
+      voice: k.voice ? String(k.voice) : null,
+      durationMs: optMs(k.durationMs, 'key.durationMs')
+    },
+    model: syncModel(o.model),
+    checkpoints: [],
+    updated: num(o.updated, 'updated', 0)
+  };
+  for (var i = 0; i < cps.length; i++) {
+    out.checkpoints.push({
+      playerMs: Math.round(num(cps[i].playerMs, 'checkpoints[' + i + '].playerMs')),
+      refMs: Math.round(num(cps[i].refMs, 'checkpoints[' + i + '].refMs'))
+    });
+  }
+  return out;
+}
+
+// Строковый ключ профиля видео: одна серия одного источника и озвучки одной длительности.
+function videoKeyString(key) {
+  return [key.card, key.season === null ? '' : key.season, key.episode === null ? '' : key.episode,
+    key.balancer || '', key.voice || '', key.durationMs === null ? '' : key.durationMs].join('|');
+}
+
+module.exports = {
+  ESTIMATORS: ESTIMATORS,
+  KINDS: KINDS,
+  STATUS: STATUS,
+  CLASSES: CLASSES,
+  PROBE_SOURCES: PROBE_SOURCES,
+  probeInfo: probeInfo,
+  hypothesis: hypothesis,
+  piece: piece,
+  syncModel: syncModel,
+  subsProfile: subsProfile,
+  videoProfile: videoProfile,
+  videoKeyString: videoKeyString
+};
+  },
+
+  "index": function (module, exports, require) {
+/*
+ * Точка входа плагина OpenSubs.
+ *
+ * Движок SubtitleEngine собирается по задачам плана (см. README). Пока его части не подключены,
+ * весь функционал даёт прототип из legacy/plugin.js — он переносится в модули по частям.
+ */
+'use strict';
+
+require('./engine/time');
+require('./engine/types');
+require('./probe/unknown');
+
+require('./legacy/plugin');
+  },
+
+  "legacy/plugin": function (module, exports, require) {
+/*
+ * OpenSubs — субтитры OpenSubtitles во встроенном плеере Lampa.
+ * Самостоятельный клиентский плагин: сервер Lampac не нужен и не затрагивается.
  * При старте видео ищет субтитры по TMDB/IMDb id (для сериалов — по сезону и серии)
  * и добавляет их в меню субтитров плеера рядом с субтитрами источника.
  */
@@ -2220,4 +2574,47 @@
       if (e.type === 'ready') start();
     });
   }
+})();
+  },
+
+  "probe/unknown": function (module, exports, require) {
+/*
+ * UnknownProbe — характеристики видео недоступны (ADR 1).
+ * Общий интерфейс VideoProbe: probe(req, done), done(ProbeInfo).
+ * Колбэк вместо Promise: часть ТВ-браузеров Lampa старше Promise.
+ * ClientProbe (HTML5-плеер, HLS) появится в задаче 2, FFProbe — по отдельному решению.
+ */
+'use strict';
+
+var types = require('../engine/types');
+
+module.exports = {
+  name: 'unknown',
+  probe: function (req, done) {
+    done(types.probeInfo({ source: 'unknown' }));
+  }
+};
+  }
+  };
+
+  var cache = {};
+  function resolve(from, to) {
+    if (to.charAt(0) !== '.') return to;
+    var parts = from.split('/');
+    var segs = to.split('/');
+    parts.pop();
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] === '..') parts.pop();
+      else if (segs[i] !== '.' && segs[i] !== '') parts.push(segs[i]);
+    }
+    return parts.join('/').replace(/\.js$/, '');
+  }
+  function load(id) {
+    if (cache[id]) return cache[id].exports;
+    if (!defs[id]) throw new Error('OpenSubs: нет модуля ' + id);
+    var module = cache[id] = { exports: {} };
+    defs[id].call(module.exports, module, module.exports, function (to) { return load(resolve(id, to)); });
+    return module.exports;
+  }
+  load('index');
 })();
