@@ -1,9 +1,9 @@
 /*
  * CardButtons — клиентский плагин Lampa (сервер не трогает).
  * В карточке фильма выносит в ряд кнопок отдельные кнопки UAFresh, «Онлайн» (Lampac) и «Торренты»
- * (штатно Lampa прячет их за «Смотреть») и убирает кнопку «Реакции» (счётчики реакций остаются).
+ * (штатно Lampa прячет их за «Смотреть»), убирает кнопки «Смотреть» и «Реакции» (счётчики реакций остаются).
  * Кнопки — копии спрятанных оригиналов: нажатие передаётся оригиналу, поэтому работают так же,
- * как из списка «Смотреть». «Смотреть» остаётся для остального (трейлеры и т.п.).
+ * как из списка «Смотреть».
  * ES5, без сборщика.
  */
 (function () {
@@ -27,10 +27,9 @@
     if (!row.length || !container.length) return;
     var changed = false;
 
-    var react = row.find('.button--reaction');
-    if (react.length) { react.remove(); changed = true; }
+    var extra = row.find('.button--reaction, .button--play');
+    if (extra.length) { extra.remove(); changed = true; }
 
-    var play = row.find('.button--play').first();
     var anchor = null; // последняя вставленная наша кнопка
     var list = originals(container);
 
@@ -52,7 +51,6 @@
       clone.on('hover:enter', function () { orig.trigger('hover:enter'); });
 
       if (anchor) anchor.after(clone);
-      else if (play.length) play.before(clone);
       else row.prepend(clone);
       anchor = clone;
       changed = true;
