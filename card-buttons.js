@@ -1,6 +1,6 @@
 /*
  * CardButtons — клиентский плагин Lampa (сервер не трогает).
- * В карточке фильма выносит в ряд кнопок отдельные кнопки UAFresh, «Онлайн» (Lampac) и «Торренты»
+ * В карточке фильма выносит в начало ряда отдельные кнопки «Онлайн» (Lampac), UAFresh и «Торренты»
  * (штатно Lampa прячет их за «Смотреть»), убирает кнопки «Смотреть» и «Реакции» (счётчики реакций остаются).
  * Кнопки — копии спрятанных оригиналов: нажатие передаётся оригиналу, поэтому работают так же,
  * как из списка «Смотреть».
@@ -12,8 +12,8 @@
   window.cardbuttons_ready = true;
 
   var SPECS = [
-    { key: 'uafresh', test: function (b) { return /ua\s*-?\s*fresh/i.test(b.text() + ' ' + (b.attr('class') || '') + ' ' + (b.attr('data-subtitle') || '')); } },
     { key: 'online', test: function (b) { return b.hasClass('lampac--button'); } },
+    { key: 'uafresh', test: function (b) { return /ua\s*-?\s*fresh/i.test(b.text() + ' ' + (b.attr('class') || '') + ' ' + (b.attr('data-subtitle') || '')); } },
     { key: 'torrent', test: function (b) { return b.hasClass('view--torrent'); } }
   ];
 
@@ -30,7 +30,6 @@
     var extra = row.find('.button--reaction, .button--play');
     if (extra.length) { extra.remove(); changed = true; }
 
-    var anchor = null; // последняя вставленная наша кнопка
     var list = originals(container);
 
     SPECS.forEach(function (spec) {
@@ -42,7 +41,7 @@
         if (clone.length) { clone.remove(); changed = true; }
         return;
       }
-      if (clone.length && clone.data('cbx-orig') === orig[0]) { anchor = clone; return; }
+      if (clone.length && clone.data('cbx-orig') === orig[0]) return;
       if (clone.length) clone.remove();
 
       clone = orig.clone();
@@ -50,11 +49,14 @@
         .addClass('cbx-btn selector').attr('data-cbx', spec.key).data('cbx-orig', orig[0]);
       clone.on('hover:enter', function () { orig.trigger('hover:enter'); });
 
-      if (anchor) anchor.after(clone);
-      else row.prepend(clone);
-      anchor = clone;
+      row.prepend(clone);
       changed = true;
     });
+
+    // порядок Онлайн, UAFresh, Торренты в начале ряда, даже если кнопки плагинов появились в другом порядке
+    if (changed) {
+      SPECS.slice().reverse().forEach(function (spec) { row.prepend(row.find('.cbx-btn[data-cbx="' + spec.key + '"]')); });
+    }
 
     // Lampa показывает «приоритетную» копию одной из кнопок (долгое нажатие в «Смотреть»); если это наша — она лишняя
     row.find('.button--priority').each(function () {
