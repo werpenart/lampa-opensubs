@@ -23,7 +23,7 @@ fi
 
 say "версия модулей в контейнере"
 for m in LME.Shared LME.Uaflix LME.Makhno LME.StarLight; do
-  v=$(docker exec lampac sh -c "grep -ho 'Version => [0-9.]*' /lampac/module/$m/ModInit.cs 2>/dev/null | head -1")
+  v=$(docker exec lampac sh -c "find /lampac/module -path '*$m/ModInit.cs' 2>/dev/null | head -1 | xargs -r grep -ho 'Version => [0-9.]*' | head -1")
   echo "  $m: ${v:-нет}"
 done
 docker exec lampac sh -c 'cat /lampac/module/.repository_state.json 2>/dev/null'; echo
@@ -60,8 +60,46 @@ if [ "$code" = 200 ] && [ $hasfile = 1 ]; then
   exit 0
 fi
 
-# ---------- 3. прокси от Eneyida ----------
-say "ashdi напрямую не отвечает — ищем прокси Eneyida в init.conf"
+echo "  ответ ashdi: $(head -c 287 /tmp/ashdi.html | tr '\n' ' ')"
+
+makhno_check() {
+  echo "  перезапуск Lampac, чтобы модуль перечитал настройки"
+  docker restart lampac >/dev/null
+  for i in $(seq 1 60); do curl -s -m5 -o /dev/null http://127.0.0.1:9118/ && break; sleep 5; done
+  sleep 20
+  for q in "id=1399&imdb_id=tt0944947&title=GoT&original_title=Game%20of%20Thrones&year=2011&serial=1" \
+           "id=546554&imdb_id=tt8946378&title=Knives&original_title=Knives%20Out&year=2019&serial=0"; do
+    echo "  lme_makhno: HTTP $(curl -s -m60 -o /dev/null -w '%{http_code}' "http://127.0.0.1:9118/lite/lme_makhno?$q")"
+  done
+}
+
+# ---------- 3a. APN автора модуля (штатный обход для ashdi в LME) ----------
+APN='https://tut.im/proxy.php?url={encodeurl}'
+say "ashdi через APN модуля (tut.im)"
+ENC=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$PLAY")
+code=$(curl -s -m40 -A "$UA" -H 'Referer: https://ashdi.vip/' -o /tmp/ashdi.html -w '%{http_code}' "https://tut.im/proxy.php?url=$ENC")
+grep -q "file" /tmp/ashdi.html 2>/dev/null && hasfile=1 || hasfile=0
+echo "  через APN: HTTP $code, $(wc -c < /tmp/ashdi.html) байт, данные плеера: $([ $hasfile = 1 ] && echo есть || echo нет)"
+if [ "$code" = 200 ] && [ $hasfile = 1 ]; then
+  say "включаем APN для LME.Makhno"
+  cp "$CONF" "$CONF.bak-makhno-$(date +%Y%m%d-%H%M%S)"
+  python3 - "$CONF" "$APN" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p, encoding="utf-8"))
+m = c.setdefault("LME.Makhno", {})
+m["apn"] = True
+m["apn_host"] = sys.argv[2]
+json.dump(c, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+print("ok")
+PY
+  makhno_check
+  echo "Готово. Вернуть как было: восстановить init.conf из $CONF.bak-makhno-*"
+  exit 0
+fi
+
+# ---------- 3b. прокси от Eneyida ----------
+say "ищем прокси Eneyida в init.conf"
 PROXY=$(python3 - "$CONF" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
