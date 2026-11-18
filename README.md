@@ -38,3 +38,12 @@ https://werpenart.github.io/lampa-opensubs/opensubs.js
 лимит OpenSubtitles без аккаунта — около 100 скачиваний в сутки.
 
 Иконка — [Lucide](https://lucide.dev) «captions» (ISC).
+
+## LampaUi (тест)
+
+Улучшения интерфейса Lampa на телефоне (шапка, нижнее меню, тест «жидкого стекла»). Собирается из приватного
+репозитория (`mods-src/LampaUi`) командой `node mods-src/tools/build-pages.js LampaUi lampaui.js`, здесь не править.
+
+```
+https://werpenart.github.io/lampa-opensubs/lampaui.js
+```
